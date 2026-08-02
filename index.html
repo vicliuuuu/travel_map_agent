@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>旅行规划 Agent · 内测 v1.0</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>旅行规划 Agent · 内测 v1.0</h1>
+    <p>输入目的地与景点，在 Google 地图上按顺序标点；配置 LLM 后可进行智能行程规划。</p>
+  </header>
+
+  <main class="layout">
+    <section class="panel controls">
+      <h2>参数设置</h2>
+
+      <div class="destination-row">
+        <label>
+          目标国家
+          <input id="countryInput" type="text" placeholder="例如：China" />
+        </label>
+        <label>
+          目标城市
+          <input id="cityInput" type="text" placeholder="例如：Paris" />
+        </label>
+      </div>
+
+      <label>
+        Google Maps API Key
+        <input id="apiKeyInput" type="password" placeholder="粘贴你的 API Key" />
+      </label>
+      <button id="connectMapBtn" type="button">连接 Google 地图</button>
+
+      <h3>景点列表</h3>
+      <div class="places-grid">
+        <div class="places-grid-header">
+          <span class="col-index">#</span>
+          <span class="col-name">景点名</span>
+          <span class="col-address">地址（可选）</span>
+          <span class="col-action"></span>
+        </div>
+        <div id="placesGridBody" class="places-grid-body"></div>
+      </div>
+      <button id="addPlaceBtn" type="button" class="btn-secondary">+ 添加景点</button>
+      <button id="markMapBtn" type="button">在地图上标点</button>
+
+      <p id="statusText" class="status">请填写目的地与景点，连接地图后点击「在地图上标点」。</p>
+
+      <h3>已解析景点</h3>
+      <div id="placesList" class="places-list"></div>
+
+      <h3>LLM 配置（智能规划必需）</h3>
+      <label>
+        LLM Base URL（OpenAI兼容）
+        <input id="llmBaseUrlInput" type="text" value="https://dashscope.aliyuncs.com/compatible-mode/v1" />
+      </label>
+      <label>
+        LLM API Key
+        <input id="llmApiKeyInput" type="password" placeholder="粘贴通义千问 DashScope API Key" />
+      </label>
+      <label>
+        已识别供应商
+        <input id="llmProviderInput" type="text" value="qwen" readonly />
+      </label>
+      <label>
+        LLM Model（自动识别下拉）
+        <select id="llmModelSelect"></select>
+      </label>
+      <label>
+        LLM Model（手动覆盖，可选）
+        <input id="llmModelInput" type="text" placeholder="默认 qwen-plus" value="qwen-plus" />
+      </label>
+      <div class="destination-row">
+        <label>
+          游玩天数
+          <input id="daysInput" type="number" min="1" max="15" value="2" />
+        </label>
+        <label>
+          默认停留时长（分钟）
+          <input id="visitMinutesInput" type="number" min="30" max="240" value="90" />
+        </label>
+      </div>
+      <button id="llmAnalyzeBtn" type="button">先用 LLM 分析景点时长</button>
+      <button id="agentPlanBtn" type="button">Agent 智能规划（LLM + Google Maps）</button>
+    </section>
+
+    <section class="panel map-panel">
+      <h2>Google 地图标点展示</h2>
+      <div id="map" class="map"></div>
+      <p class="tips">无 LLM 时仅按输入顺序标点（1、2、3…）；智能规划后展示完整路线。</p>
+    </section>
+
+    <section class="panel itinerary">
+      <h2>智能路书</h2>
+      <div id="itineraryResult" class="itinerary-result">
+        <p class="itinerary-placeholder">填写 LLM 配置并点击「Agent 智能规划」后，路书将显示在这里。</p>
+      </div>
+    </section>
+  </main>
+
+  <script src="./location-data.js"></script>
+  <script src="./planner.js"></script>
+  <script src="./llm.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>
