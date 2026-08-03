@@ -138,3 +138,70 @@
 - `内测-v1.1-改进规划.md` 补充 §4：酒店锚点（单酒店、入住/退房日期、每日起终点回酒店）；§5 Prompt 综合重写草案（含 `dailyPlans`、`lodgingSummary`）；同步更新优先级、风险与差异表。
 
 修改时间：2026-07-31 18:07 (UTC+8)
+
+## 2026-08-02
+
+- 实现内测 v1.1 P0/P1 主路径：左侧输入区升级为「酒店 + 多国家/多城市/城市内景点」层级结构（`index.html`、`styles.css`、`app.js`）。
+- 前端新增单酒店入住/退房输入与夜数自动推算，行程天数与住宿区间联动（`app.js`、`planner.js`）。
+- 后端 `POST /api/agent/plan` 支持 `destinations + lodging`，并兼容旧版 `country/city/places` 输入（`server.js`、`planner.js`）。
+- Agent Prompt 升级到 v1.1 输出结构：`lodgingSummary`、`dailyPlans`、`validation`、`alternativeProposals`（`llm.js`）。
+- 新增行程校验能力：景点声明归属与 geocode 结果比对、按日时长可行性评估（含酒店往返启发式）（`server.js`、`agent-planner.js`）。
+- 智能路书面板新增住宿摘要、按日闭环路书、校验结果与替代方案展示（`app.js`）。
+- 补充并通过测试：`tests/planner.test.js`、`tests/llm.test.js`、`tests/agent-planner.test.js`。
+
+修改时间：2026-08-02 10:50 (UTC+8)
+
+## 2026-08-02
+
+- 调整酒店日期联动：入住/退房仅计算“夜数参考”，不再自动覆盖用户填写的游玩天数（`app.js`、`server.js`、`index.html`）。
+- 调整默认输入：目的地初始化不再预填 `China / Beijing`，改为完全空白由用户自行填写（`app.js`）。
+- 扩充 Qwen 模型下拉预设，补充 `qwen-plus-latest`、`qwen-max-latest`、`qwen3-plus`、`qwen3-max` 等可选项（`llm.js`）。
+- 地图新增酒店独立标记：在标点模式与智能路书地图渲染中均尝试添加 `H` 酒店点（`app.js`）。
+
+修改时间：2026-08-02 11:14 (UTC+8)
+
+## 2026-08-02
+
+- 实现 A+B 方案：新增 `/api/agent/plan/stream` 流式进度接口（NDJSON），前端接入阶段提示与进度条（`server.js`、`app.js`、`index.html`、`styles.css`）。
+- 修复跨城误判：城市/国家归属匹配改为去音符归一化比较（如 `Malmo` 与 `Malmö` 不再误判不一致）（`server.js`）。
+- 修复“2天3点却判不可行”链路：可行性评估改为基于系统构建的 `planData -> dailyPlans`，不再信任模型随意输出的 `validation.timeFeasibility`（`server.js`、`agent-planner.js`）。
+- 修复“按日行程重复/漏点”问题：`dailyPlans` 改为由后端确定性生成，确保与 `recommendedOrder` 一致、每个景点仅出现一次并保持酒店闭环（`agent-planner.js`、`server.js`）。
+- 清理不可信待核实报错：`validation.warnings` 仅保留本地可证据化结果，避免模型臆断“地理编码连续失败”等假告警（`server.js`）。
+- 新增测试覆盖：`buildDailyPlansFromPlanData` 用例（`tests/agent-planner.test.js`）。
+
+修改时间：2026-08-02 11:22 (UTC+8)
+
+## 2026-08-03
+
+- 优化主界面展示：新增三态布局切换（填写信息居中 / 地图居中 / 智能路书居中），根据输入、标点、规划阶段自动切换（`index.html`、`styles.css`、`app.js`）。
+- 新增路书导出能力：在智能路书面板支持导出 `TXT`（包含概述、策略、住宿、按日行程、可行性、注意事项）（`index.html`、`app.js`）。
+- 强化“先独立推导可行天数，再对比用户天数”策略：提示词增加两阶段推理要求（先自然规划，再按用户天数对齐）（`llm.js`）。
+- 后端新增本地天数决策与景点裁剪：不再盲信用户天数，先估算自然天数；若用户天数不足则自动精简景点并返回替代方案，若用户天数偏多则自动压缩天数（`server.js`）。
+- 统一输出一致性：`recommendedOrder`、`placeSpotlights`、`roadbook`、`dailyPlans` 均按最终保留景点同步过滤，避免展示与实际排程不一致（`server.js`）。
+
+修改时间：2026-08-03 10:10 (UTC+8)
+
+## 2026-08-03
+
+- 酒店模块改为“可选项”：仅当填写酒店名称或地址时才进入规划输入，避免被视为必填（`app.js`、`server.js`）。
+- 移除酒店入住/退房夜数统计展示，不再在输入区显示“共 N 晚”等自动统计信息（`index.html`、`app.js`）。
+- 明确天数依据：行程预估只参考用户填写的 `游玩天数(totalDays)` 与景点路程逻辑，不使用酒店日期作为天数约束（`llm.js`、`server.js`）。
+
+修改时间：2026-08-03 10:11 (UTC+8)
+
+## 2026-08-03
+
+- 输入模型统一：移除独立酒店输入区，改为在每条点位行增加“酒店锚点”勾选，酒店与景点共用同一结构与输入样式（`index.html`、`app.js`、`styles.css`）。
+- 酒店字段收敛：酒店只保留位置锚点语义（名称/地址），不再使用入住/离开日期（`app.js`、`server.js`、`llm.js`）。
+- 处理链路统一：前端与后端均从点位列表中提取酒店锚点（首个勾选项），并从游览景点集合中剔除，后续流程与既有路书逻辑保持一致（`app.js`、`server.js`、`planner.js`）。
+- UI 精简：LLM 配置仅保留模型下拉，不再显示“手动覆盖模型”输入框（`index.html`、`app.js`）。
+- 无酒店场景优化：按日路书生成在未设置酒店时不再强行插入“酒店往返”交通段（`agent-planner.js`、`llm.js`）。
+
+修改时间：2026-08-03 10:21 (UTC+8)
+
+## 2026-08-03
+
+- 点位类型交互升级：将“酒店锚点勾选”改为“景点/酒店”下拉选择，且默认值为“景点”（`app.js`、`styles.css`、`index.html`）。
+- 前端收集结构同步更新：点位行新增 `type` 字段（`scenic`/`hotel`），并保持 `isHotel` 兼容标记（`app.js`）。
+
+修改时间：2026-08-03 10:28 (UTC+8)
