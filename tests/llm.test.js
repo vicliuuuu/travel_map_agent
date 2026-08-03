@@ -41,6 +41,40 @@ test("parseAgentPlanJson supports roadbook and precautions", () => {
     places: [
       { name: "卢浮宫", suggestedDurationMin: 210, priority: "high", reason: "馆藏丰富" },
     ],
+    lodgingSummary: {
+      hotelName: "北京饭店",
+      checkInDate: "2026-08-01",
+      checkOutDate: "2026-08-04",
+      nights: 3,
+    },
+    dailyPlans: [
+      {
+        day: 1,
+        date: "2026-08-01",
+        hotelName: "北京饭店",
+        segments: [
+          { type: "transit", from: "酒店", to: "卢浮宫", durationRange: "约20分钟", durationMin: 20 },
+          { type: "visit", placeName: "卢浮宫", visitTimeRange: "3-4小时", visitDurationMin: 210 },
+        ],
+      },
+    ],
+    validation: {
+      timeFeasibility: {
+        feasible: false,
+        requestedDays: 1,
+        suggestedDays: 2,
+        reason: "时长超载",
+      },
+      excludedPlaces: [
+        {
+          name: "天津之眼",
+          declaredCity: "Beijing",
+          declaredCountry: "China",
+          reason: "不在声明城市",
+        },
+      ],
+      warnings: ["事实待核实"],
+    },
   });
 
   const parsed = llm.parseAgentPlanJson(raw);
@@ -49,6 +83,9 @@ test("parseAgentPlanJson supports roadbook and precautions", () => {
   assert.equal(parsed.roadbook.length, 2);
   assert.equal(parsed.precautions.length, 2);
   assert.deepEqual(parsed.recommendedOrder, ["卢浮宫", "埃菲尔铁塔"]);
+  assert.equal(parsed.lodgingSummary.hotelName, "北京饭店");
+  assert.equal(parsed.dailyPlans.length, 1);
+  assert.equal(parsed.validation.excludedPlaces.length, 1);
 });
 
 test("parseAnalysisJson supports fenced json response", () => {
@@ -95,4 +132,27 @@ test("provider detection infers qwen and openai model lists", () => {
   const openaiProvider = llm.detectProviderByBaseUrl("https://api.openai.com/v1");
   assert.equal(openaiProvider.provider, "openai");
   assert.ok(llm.getProviderModels("openai").includes("gpt-4o-mini"));
+});
+
+test("buildAgentUserPrompt includes v1.1 structures", () => {
+  const prompt = llm.buildAgentUserPrompt({
+    country: "China",
+    city: "Beijing",
+    totalDays: 2,
+    places: [{ name: "故宫", address: "" }],
+    destinations: [
+      {
+        country: "China",
+        cities: [{ city: "Beijing", places: [{ name: "故宫", address: "" }] }],
+      },
+    ],
+    lodging: {
+      mode: "single",
+      hotel: { name: "北京饭店", checkInDate: "2026-08-01", checkOutDate: "2026-08-03" },
+    },
+  });
+
+  assert.ok(prompt.includes("dailyPlans"));
+  assert.ok(prompt.includes("validation"));
+  assert.ok(prompt.includes("destinations"));
 });

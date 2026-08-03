@@ -1,14 +1,11 @@
-(function () {
+ (function () {
   "use strict";
-
-  var featureFlags = {
-    mapPickEntryEnabled: false,
-  };
 
   var state = {
     places: [],
     llmInsights: {},
-    selectedCountryCode: "",
+    layoutMode: "input",
+    lastRoadbookExport: null,
     mapReady: false,
     mapLoading: false,
     map: null,
@@ -16,24 +13,26 @@
     directionsService: null,
     routeRenderers: [],
     routeMarkers: [],
-    mapPickListener: null,
   };
 
   var ui = {
-    countryInput: document.getElementById("countryInput"),
-    cityInput: document.getElementById("cityInput"),
+    layoutRoot: document.getElementById("mainLayout"),
+    destinationsRoot: document.getElementById("destinationsRoot"),
+    addCountryBtn: document.getElementById("addCountryBtn"),
     apiKeyInput: document.getElementById("apiKeyInput"),
     connectMapBtn: document.getElementById("connectMapBtn"),
-    placesGridBody: document.getElementById("placesGridBody"),
-    addPlaceBtn: document.getElementById("addPlaceBtn"),
     markMapBtn: document.getElementById("markMapBtn"),
     llmBaseUrlInput: document.getElementById("llmBaseUrlInput"),
     llmApiKeyInput: document.getElementById("llmApiKeyInput"),
     llmProviderInput: document.getElementById("llmProviderInput"),
     llmModelSelect: document.getElementById("llmModelSelect"),
-    llmModelInput: document.getElementById("llmModelInput"),
     llmAnalyzeBtn: document.getElementById("llmAnalyzeBtn"),
     agentPlanBtn: document.getElementById("agentPlanBtn"),
+    planProgressWrap: document.getElementById("planProgressWrap"),
+    planProgressStage: document.getElementById("planProgressStage"),
+    planProgressPercent: document.getElementById("planProgressPercent"),
+    planProgressFill: document.getElementById("planProgressFill"),
+    downloadRoadbookBtn: document.getElementById("downloadRoadbookBtn"),
     daysInput: document.getElementById("daysInput"),
     visitMinutesInput: document.getElementById("visitMinutesInput"),
     statusText: document.getElementById("statusText"),
@@ -44,37 +43,16 @@
   var ITINERARY_PLACEHOLDER =
     "<p class=\"itinerary-placeholder\">填写 LLM 配置并点击「Agent 智能规划」后，路书将显示在这里。</p>";
 
-  function getCountryValue() {
-    return ui.countryInput.value.trim();
-  }
-
-  function getCityValue() {
-    return ui.cityInput.value.trim();
-  }
-
-  function syncSelectedCountryCode() {
-    if (!window.TravelLocationData) {
-      state.selectedCountryCode = "";
-      return;
-    }
-    state.selectedCountryCode = window.TravelLocationData.getCountryCodeFromInput(getCountryValue());
-  }
-
-  function getCommonTripInput() {
+  function primaryDestination(destinations) {
+    var firstCountry = destinations[0] || {};
+    var firstCity = (firstCountry.cities || [])[0] || {};
     return {
-      country: getCountryValue(),
-      city: getCityValue(),
-      totalDays: Number(ui.daysInput.value),
-      visitMinutes: Number(ui.visitMinutesInput.value),
-      places: mergePlacesWithLlmInsights(collectPlacesFromGrid()),
+      country: String(firstCountry.country || "").trim(),
+      city: String(firstCity.city || "").trim(),
     };
   }
 
   function pickLlmModelValue() {
-    var manualModel = ui.llmModelInput.value.trim();
-    if (manualModel) {
-      return manualModel;
-    }
     var selectedModel = ui.llmModelSelect.value.trim();
     if (!selectedModel) {
       return "";
@@ -114,15 +92,55 @@
     var currentSelected = pickLlmModelValue();
     updateModelSelectOptions(models, currentSelected);
 
-    if (!ui.llmModelInput.value.trim() && ui.llmModelSelect.value) {
-      ui.llmModelInput.value = ui.llmModelSelect.value;
-    }
   }
 
   function updateStatus(text, isError) {
     ui.statusText.textContent = text;
     ui.statusText.style.borderColor = isError ? "#fecaca" : "#bfdbfe";
     ui.statusText.style.background = isError ? "#fef2f2" : "#eff6ff";
+  }
+
+  function setLayoutMode(mode) {
+    var nextMode = mode || "map";
+    state.layoutMode = nextMode;
+    if (!ui.layoutRoot) {
+      return;
+    }
+    ui.layoutRoot.classList.remove("mode-input-focus", "mode-map-focus", "mode-roadbook-focus");
+    if (nextMode === "input") {
+      ui.layoutRoot.classList.add("mode-input-focus");
+      return;
+    }
+    if (nextMode === "roadbook") {
+      ui.layoutRoot.classList.add("mode-roadbook-focus");
+      return;
+    }
+    ui.layoutRoot.classList.add("mode-map-focus");
+  }
+
+  function setPlanProgressVisible(visible) {
+    if (visible) {
+      ui.planProgressWrap.classList.remove("hidden");
+    } else {
+      ui.planProgressWrap.classList.add("hidden");
+    }
+  }
+
+  function updatePlanProgress(percent, stageText) {
+    var safePercent = Number(percent);
+    if (!Number.isFinite(safePercent)) {
+      safePercent = 0;
+    }
+    safePercent = Math.max(0, Math.min(100, Math.round(safePercent)));
+    ui.planProgressFill.style.width = safePercent + "%";
+    ui.planProgressPercent.textContent = safePercent + "%";
+    ui.planProgressStage.textContent = stageText || "处理中...";
+  }
+
+  function setPlanningLoading(isLoading) {
+    ui.agentPlanBtn.disabled = Boolean(isLoading);
+    ui.llmAnalyzeBtn.disabled = Boolean(isLoading);
+    ui.markMapBtn.disabled = Boolean(isLoading);
   }
 
   function clearRouteOverlays() {
@@ -137,113 +155,157 @@
     state.routeMarkers = [];
   }
 
-  function createPlaceRow(nameValue, addressValue) {
+  function createPlaceRow(nameValue, addressValue, placeTypeValue) {
     var row = document.createElement("div");
-    row.className = "places-grid-row";
-
-    var indexCell = document.createElement("span");
-    indexCell.className = "col-index place-row-index";
-
-    var nameInput = document.createElement("input");
-    nameInput.type = "text";
-    nameInput.className = "place-name-input";
-    nameInput.placeholder = "景点名称";
-    nameInput.value = nameValue || "";
-
-    var addressInput = document.createElement("input");
-    addressInput.type = "text";
-    addressInput.className = "place-address-input";
-    addressInput.placeholder = "详细地址";
-    addressInput.value = addressValue || "";
-
-    var removeBtn = document.createElement("button");
-    removeBtn.type = "button";
-    removeBtn.className = "btn-icon";
-    removeBtn.textContent = "×";
-    removeBtn.title = "删除此行";
-    removeBtn.addEventListener("click", function () {
-      removePlaceRow(row);
-    });
-
-    row.appendChild(indexCell);
-    row.appendChild(nameInput);
-    row.appendChild(addressInput);
-    row.appendChild(removeBtn);
+    row.className = "places-grid-row place-row";
+    row.innerHTML =
+      "<span class=\"col-index place-row-index\"></span>" +
+      "<input type=\"text\" class=\"place-name-input\" placeholder=\"点位名称\" />" +
+      "<input type=\"text\" class=\"place-address-input\" placeholder=\"详细地址（可选）\" />" +
+      "<select class=\"place-type-select\"><option value=\"scenic\">景点</option><option value=\"hotel\">酒店</option></select>" +
+      "<button type=\"button\" class=\"btn-icon btn-remove-place\">×</button>";
+    row.querySelector(".place-name-input").value = nameValue || "";
+    row.querySelector(".place-address-input").value = addressValue || "";
+    row.querySelector(".place-type-select").value = placeTypeValue === "hotel" ? "hotel" : "scenic";
     return row;
   }
 
-  function refreshPlaceRowIndexes() {
-    var rows = ui.placesGridBody.querySelectorAll(".places-grid-row");
+  function createCityBlock(cityValue) {
+    var cityBlock = document.createElement("section");
+    cityBlock.className = "destination-city";
+    cityBlock.innerHTML =
+      "<div class=\"destination-row\">" +
+      "<label>城市<input type=\"text\" class=\"city-input\" placeholder=\"例如：Beijing\" /></label>" +
+      "<button type=\"button\" class=\"btn-secondary btn-remove-city\">删除城市</button>" +
+      "</div>" +
+      "<div class=\"places-grid\">" +
+      "<div class=\"places-grid-header\">" +
+      "<span class=\"col-index\">#</span><span class=\"col-name\">点位名</span><span class=\"col-address\">地址（可选）</span><span class=\"col-type\">酒店锚点</span><span class=\"col-action\"></span>" +
+      "</div>" +
+      "<div class=\"city-places-grid-body\"></div>" +
+      "</div>" +
+      "<button type=\"button\" class=\"btn-secondary btn-add-place\">+ 添加点位</button>";
+    cityBlock.querySelector(".city-input").value = cityValue || "";
+    return cityBlock;
+  }
+
+  function createCountryBlock(countryValue) {
+    var countryBlock = document.createElement("section");
+    countryBlock.className = "destination-country";
+    countryBlock.innerHTML =
+      "<div class=\"destination-row\">" +
+      "<label>国家/地区<input type=\"text\" class=\"country-input\" placeholder=\"例如：China\" /></label>" +
+      "<button type=\"button\" class=\"btn-secondary btn-remove-country\">删除国家</button>" +
+      "</div>" +
+      "<div class=\"country-cities\"></div>" +
+      "<button type=\"button\" class=\"btn-secondary btn-add-city\">+ 添加城市</button>";
+    countryBlock.querySelector(".country-input").value = countryValue || "";
+    return countryBlock;
+  }
+
+  function refreshPlaceIndexesWithinCity(cityBlock) {
+    var rows = cityBlock.querySelectorAll(".place-row");
     rows.forEach(function (row, index) {
-      var indexCell = row.querySelector(".place-row-index");
-      if (indexCell) {
-        indexCell.textContent = String(index + 1);
-      }
+      row.querySelector(".place-row-index").textContent = String(index + 1);
     });
   }
 
-  function addPlaceRow(nameValue, addressValue) {
-    var row = createPlaceRow(nameValue, addressValue);
-    ui.placesGridBody.appendChild(row);
-    refreshPlaceRowIndexes();
-    return row;
+  function addPlaceRowToCity(cityBlock, nameValue, addressValue, placeTypeValue) {
+    var body = cityBlock.querySelector(".city-places-grid-body");
+    body.appendChild(createPlaceRow(nameValue, addressValue, placeTypeValue));
+    refreshPlaceIndexesWithinCity(cityBlock);
   }
 
-  function removePlaceRow(row) {
-    var rows = ui.placesGridBody.querySelectorAll(".places-grid-row");
-    if (rows.length <= 1) {
-      row.querySelector(".place-name-input").value = "";
-      row.querySelector(".place-address-input").value = "";
-      updateStatus("至少保留一行景点输入。", false);
-      return;
-    }
-    row.remove();
-    refreshPlaceRowIndexes();
+  function addCityToCountry(countryBlock, cityValue) {
+    var city = createCityBlock(cityValue);
+    countryBlock.querySelector(".country-cities").appendChild(city);
+    addPlaceRowToCity(city, "", "", false);
   }
 
-  function collectPlaceRowsFromGrid() {
-    var rows = ui.placesGridBody.querySelectorAll(".places-grid-row");
-    return Array.prototype.map.call(rows, function (row) {
+  function addCountry(countryValue) {
+    var countryBlock = createCountryBlock(countryValue);
+    ui.destinationsRoot.appendChild(countryBlock);
+    addCityToCountry(countryBlock, "");
+  }
+
+  function collectDestinationsFromUI() {
+    var countryBlocks = ui.destinationsRoot.querySelectorAll(".destination-country");
+    return Array.prototype.map.call(countryBlocks, function (countryBlock) {
+      var country = countryBlock.querySelector(".country-input").value.trim();
+      var cityBlocks = countryBlock.querySelectorAll(".destination-city");
+      var cities = Array.prototype.map.call(cityBlocks, function (cityBlock) {
+        var city = cityBlock.querySelector(".city-input").value.trim();
+        var rows = cityBlock.querySelectorAll(".place-row");
+        var places = Array.prototype.map.call(rows, function (row) {
+          var placeType = row.querySelector(".place-type-select").value === "hotel" ? "hotel" : "scenic";
+          return {
+            name: row.querySelector(".place-name-input").value.trim(),
+            address: row.querySelector(".place-address-input").value.trim(),
+            isHotel: placeType === "hotel",
+            type: placeType,
+          };
+        }).filter(function (place) {
+          return place.name || place.address;
+        });
+        return {
+          city: city,
+          places: places,
+        };
+      }).filter(function (cityBlockData) {
+        return cityBlockData.city || cityBlockData.places.length;
+      });
       return {
-        name: row.querySelector(".place-name-input").value.trim(),
-        address: row.querySelector(".place-address-input").value.trim(),
+        country: country,
+        cities: cities,
       };
+    }).filter(function (countryBlockData) {
+      return countryBlockData.country || countryBlockData.cities.length;
     });
   }
 
-  function collectPlacesFromGrid() {
-    var country = getCountryValue();
-    var city = getCityValue();
-    return window.TravelPlanner.parsePlaceRows(collectPlaceRowsFromGrid(), country, city);
-  }
-
-  function appendPlaceToGrid(placeName, placeAddress) {
-    var rows = collectPlaceRowsFromGrid();
-    var lastRow = rows[rows.length - 1];
-    if (lastRow && !lastRow.name && !lastRow.address) {
-      var gridRows = ui.placesGridBody.querySelectorAll(".places-grid-row");
-      var targetRow = gridRows[gridRows.length - 1];
-      targetRow.querySelector(".place-name-input").value = placeName;
-      targetRow.querySelector(".place-address-input").value = placeAddress || "";
-      return;
-    }
-    addPlaceRow(placeName, placeAddress || "");
-  }
-
-  function bindMapPickEntryHook() {
-    if (!state.map || !featureFlags.mapPickEntryEnabled) {
-      return;
-    }
-    if (state.mapPickListener) {
-      return;
-    }
-    state.mapPickListener = state.map.addListener("click", function (event) {
-      var lat = event.latLng.lat().toFixed(6);
-      var lng = event.latLng.lng().toFixed(6);
-      var placeName = "地图选点(" + lat + "," + lng + ")";
-      appendPlaceToGrid(placeName, "");
-      updateStatus("已通过地图切口追加景点。", false);
+  function splitLodgingFromPlaces(flatPlaces) {
+    var places = Array.isArray(flatPlaces) ? flatPlaces : [];
+    var hotelCandidate = null;
+    var nonHotelPlaces = [];
+    places.forEach(function (place) {
+      if (place.isHotel && !hotelCandidate) {
+        hotelCandidate = place;
+        return;
+      }
+      nonHotelPlaces.push(place);
     });
+    var lodging = null;
+    if (hotelCandidate) {
+      lodging = {
+        mode: "single",
+        hotel: {
+          name: hotelCandidate.name || "酒店",
+          address: hotelCandidate.addressExtra || hotelCandidate.address || "",
+          checkInDate: "",
+          checkOutDate: "",
+        },
+      };
+    }
+    return {
+      lodging: lodging,
+      places: nonHotelPlaces,
+    };
+  }
+
+  function collectAllTripInput() {
+    var destinations = collectDestinationsFromUI();
+    var flatPlaces = window.TravelPlanner.flattenDestinations(destinations);
+    var splitResult = splitLodgingFromPlaces(flatPlaces);
+    var primary = primaryDestination(destinations);
+    return {
+      destinations: destinations,
+      places: mergePlacesWithLlmInsights(splitResult.places),
+      country: primary.country,
+      city: primary.city,
+      lodging: splitResult.lodging,
+      totalDays: Number(ui.daysInput.value),
+      visitMinutes: Number(ui.visitMinutesInput.value),
+    };
   }
 
   function splitStopsIntoRouteSegments(stops, maxStopsPerSegment) {
@@ -319,15 +381,20 @@
     });
   }
 
-  async function resolvePlacesForMap(places, country, city) {
-    syncSelectedCountryCode();
-    var countryCode = state.selectedCountryCode;
+  async function resolvePlacesForMap(places) {
     var resolved = [];
     var i;
 
     for (i = 0; i < places.length; i += 1) {
       var place = places[i];
-      var query = buildPlaceGeocodeQuery(place, country, city);
+      var query = buildPlaceGeocodeQuery(
+        place,
+        place.declaredCountry || "",
+        place.declaredCity || ""
+      );
+      var countryCode = window.TravelLocationData
+        ? window.TravelLocationData.getCountryCodeFromInput(place.declaredCountry || "")
+        : "";
       var geo = await geocodePlace(query, countryCode);
       resolved.push({
         title: place.name,
@@ -343,26 +410,68 @@
     return resolved;
   }
 
+  async function resolveHotelForMap(lodging, fallbackCountry, fallbackCity) {
+    if (!lodging || !lodging.hotel) {
+      return null;
+    }
+    var hotel = lodging.hotel;
+    var hotelName = String(hotel.name || "").trim();
+    var hotelAddress = String(hotel.address || "").trim();
+    if (!hotelName && !hotelAddress) {
+      return null;
+    }
+    var query = window.TravelPlanner.buildGeocodeQuery(
+      {
+        name: hotelName || "酒店",
+        addressExtra: hotelAddress,
+      },
+      fallbackCountry || "",
+      fallbackCity || ""
+    );
+    var countryCode = window.TravelLocationData
+      ? window.TravelLocationData.getCountryCodeFromInput(fallbackCountry || "")
+      : "";
+    var geo = await geocodePlace(query, countryCode);
+    return {
+      title: hotelName || "酒店",
+      formattedAddress: geo.formattedAddress,
+      latLng: geo.latLng,
+    };
+  }
+
+  function placeHotelMarker(hotelInfo) {
+    if (!hotelInfo) {
+      return null;
+    }
+    var marker = new google.maps.Marker({
+      map: state.map,
+      position: hotelInfo.latLng,
+      label: {
+        text: "H",
+        color: "#ffffff",
+        fontWeight: "700",
+      },
+      title: "酒店 · " + hotelInfo.title + " - " + hotelInfo.formattedAddress,
+    });
+    state.routeMarkers.push(marker);
+    return marker;
+  }
+
   async function markOrderedPlacesOnMap() {
     if (!state.mapReady) {
       updateStatus("请先连接 Google 地图。", true);
       return;
     }
 
-    var country = getCountryValue();
-    var city = getCityValue();
-    var places = collectPlacesFromGrid();
-
-    if (!country) {
-      updateStatus("请输入目标国家。", true);
-      return;
-    }
-    if (!city) {
-      updateStatus("请输入目标城市。", true);
+    var tripInput = collectAllTripInput();
+    var destinations = tripInput.destinations;
+    var places = tripInput.places;
+    if (!destinations.length) {
+      updateStatus("请至少填写一个国家和城市。", true);
       return;
     }
     if (!places.length) {
-      updateStatus("请至少填写一个景点。", true);
+      updateStatus("请至少填写一个点位。", true);
       return;
     }
 
@@ -371,8 +480,11 @@
     updateStatus("正在地理编码并在地图上标点...", false);
 
     try {
-      var resolvedStops = await resolvePlacesForMap(places, country, city);
+      var resolvedStops = await resolvePlacesForMap(places);
+      var primary = primaryDestination(destinations);
+      var hotelStop = await resolveHotelForMap(tripInput.lodging, primary.country, primary.city);
       clearRouteOverlays();
+      placeHotelMarker(hotelStop);
 
       resolvedStops.forEach(function (stop, index) {
         if (stop.sourcePlace) {
@@ -387,7 +499,12 @@
           map: state.map,
           position: stop.latLng,
           label: String(index + 1),
-          title: stop.title + " - " + stop.formattedAddress,
+        title:
+          (stop.sourcePlace.declaredCity || "") +
+          " · " +
+          stop.title +
+          " - " +
+          stop.formattedAddress,
         });
         state.routeMarkers.push(marker);
       });
@@ -395,24 +512,28 @@
       state.places = places;
       renderPlacesList();
 
-      if (resolvedStops.length === 1) {
+      if (resolvedStops.length === 1 && !hotelStop) {
         state.map.setCenter(resolvedStops[0].latLng);
         state.map.setZoom(14);
       } else {
         var bounds = new google.maps.LatLngBounds();
+        if (hotelStop) {
+          bounds.extend(hotelStop.latLng);
+        }
         resolvedStops.forEach(function (stop) {
           bounds.extend(stop.latLng);
         });
         state.map.fitBounds(bounds);
       }
 
-      updateStatus("已在地图上按顺序标点（共 " + resolvedStops.length + " 个），具体位置见下方解析结果。", false);
+      updateStatus("已在地图上按顺序标点（共 " + resolvedStops.length + " 个）" + (hotelStop ? "，并标记酒店 H 点" : "") + "。", false);
+      setLayoutMode("map");
     } catch (err) {
       updateStatus("地图标点失败: " + err.message, true);
     }
   }
 
-  async function renderRouteOnMap(planData, country, city) {
+  async function renderRouteOnMap(planData, country, city, lodgingSummary) {
     if (!state.mapReady) {
       updateStatus("请先连接 Google 地图。", true);
       return;
@@ -429,15 +550,19 @@
 
     var resolvedStops = [];
     var i;
-    syncSelectedCountryCode();
-    var countryCode = state.selectedCountryCode;
-
     for (i = 0; i < routeStops.length; i += 1) {
       var stop = routeStops[i];
-      var query = window.TravelPlanner.buildGeocodeQuery({
-        name: stop.title,
-        addressExtra: "",
-      }, country, city);
+      var query = stop.address || window.TravelPlanner.buildGeocodeQuery(
+        {
+          name: stop.title,
+          addressExtra: "",
+        },
+        country,
+        city
+      );
+      var countryCode = window.TravelLocationData
+        ? window.TravelLocationData.getCountryCodeFromInput(stop.country || country || "")
+        : "";
       var geo = await geocodePlace(query, countryCode);
       resolvedStops.push({
         title: stop.title,
@@ -450,6 +575,24 @@
     }
 
     clearRouteOverlays();
+    if (lodgingSummary && (lodgingSummary.formattedAddress || lodgingSummary.hotelName)) {
+      var hotelQuery = String(lodgingSummary.formattedAddress || lodgingSummary.hotelName || "");
+      if (hotelQuery) {
+        try {
+          var hotelCountryCode = window.TravelLocationData
+            ? window.TravelLocationData.getCountryCodeFromInput(country || "")
+            : "";
+          var hotelGeo = await geocodePlace(hotelQuery, hotelCountryCode);
+          placeHotelMarker({
+            title: lodgingSummary.hotelName || "酒店",
+            formattedAddress: hotelGeo.formattedAddress,
+            latLng: hotelGeo.latLng,
+          });
+        } catch (err) {
+          // ignore hotel marker failure
+        }
+      }
+    }
 
     resolvedStops.forEach(function (stop, index) {
       var marker = new google.maps.Marker({
@@ -495,7 +638,7 @@
 
   function renderPlacesList() {
     if (!state.places.length) {
-      ui.placesList.innerHTML = "<p>暂无景点，请先填写景点列表。</p>";
+      ui.placesList.innerHTML = "<p>暂无点位，请先填写点位列表。</p>";
       return;
     }
 
@@ -536,6 +679,101 @@
       .replace(/'/g, "&#39;");
   }
 
+  function buildRoadbookText(exportData) {
+    var data = exportData || {};
+    var result = [];
+    result.push("智能路书导出");
+    result.push("生成时间: " + new Date().toLocaleString());
+    result.push("目的地: " + (data.city || "") + (data.country ? (", " + data.country) : ""));
+    result.push("");
+    if (data.summary) {
+      result.push("【行程概述】");
+      result.push(data.summary);
+      result.push("");
+    }
+    if (data.routeStrategy) {
+      result.push("【路线策略】");
+      result.push(data.routeStrategy);
+      result.push("");
+    }
+    if (data.lodgingSummary && data.lodgingSummary.hotelName) {
+      result.push("【住宿摘要】");
+      result.push("酒店: " + data.lodgingSummary.hotelName);
+      if (data.lodgingSummary.formattedAddress) {
+        result.push("地址: " + data.lodgingSummary.formattedAddress);
+      }
+      if (
+        (data.lodgingSummary.checkInDate || "").trim() ||
+        (data.lodgingSummary.checkOutDate || "").trim() ||
+        data.lodgingSummary.nights
+      ) {
+        result.push(
+          "日期: " +
+          (data.lodgingSummary.checkInDate || "") +
+          " ~ " +
+          (data.lodgingSummary.checkOutDate || "") +
+          (data.lodgingSummary.nights ? ("（" + data.lodgingSummary.nights + "晚）") : "")
+        );
+      }
+      result.push("");
+    }
+    var dailyPlans = Array.isArray(data.dailyPlans) ? data.dailyPlans : [];
+    if (dailyPlans.length) {
+      result.push("【按日行程】");
+      dailyPlans.forEach(function (dayPlan) {
+        result.push("Day " + dayPlan.day + (dayPlan.date ? (" · " + dayPlan.date) : ""));
+        (Array.isArray(dayPlan.segments) ? dayPlan.segments : []).forEach(function (segment) {
+          if (segment.type === "visit") {
+            result.push("  - 游览 " + segment.placeName + (segment.visitTimeRange ? ("（" + segment.visitTimeRange + "）") : ""));
+          } else {
+            result.push("  - 交通 " + segment.from + " -> " + segment.to + (segment.durationRange ? ("（" + segment.durationRange + "）") : ""));
+          }
+        });
+      });
+      result.push("");
+    }
+    if (data.validation && data.validation.timeFeasibility) {
+      var tf = data.validation.timeFeasibility;
+      result.push("【行程校验】");
+      result.push("可行性: " + (tf.feasible ? "可行" : "可能超载"));
+      if (tf.reason) {
+        result.push("原因: " + tf.reason);
+      }
+      if (Number.isFinite(tf.suggestedDays)) {
+        result.push("建议天数: " + tf.suggestedDays);
+      }
+      result.push("");
+    }
+    var precautions = Array.isArray(data.precautions) ? data.precautions : [];
+    if (precautions.length) {
+      result.push("【注意事项】");
+      precautions.forEach(function (item) {
+        result.push("  - " + item);
+      });
+      result.push("");
+    }
+    return result.join("\n");
+  }
+
+  function downloadRoadbookText() {
+    if (!state.lastRoadbookExport) {
+      updateStatus("暂无可导出的路书，请先生成智能路书。", true);
+      return;
+    }
+    var text = buildRoadbookText(state.lastRoadbookExport);
+    var blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+    var url = URL.createObjectURL(blob);
+    var link = document.createElement("a");
+    var dateText = new Date().toISOString().slice(0, 10);
+    link.href = url;
+    link.download = "智能路书-" + dateText + ".txt";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+    updateStatus("已导出 TXT 路书。", false);
+  }
+
   function renderAgentRoadbook(agentResult, country, city) {
     if (!agentResult) {
       ui.itineraryResult.innerHTML = "<p>无路书内容，请检查 LLM 配置后重试。</p>";
@@ -558,6 +796,31 @@
         "<section class=\"roadbook-section\">" +
         "<h3>路线策略</h3>" +
         "<p>" + escapeHtml(agentResult.routeStrategy) + "</p>" +
+        "</section>"
+      );
+    }
+
+    if (agentResult.lodgingSummary && agentResult.lodgingSummary.hotelName) {
+      var hasDateInfo = Boolean(
+        (agentResult.lodgingSummary.checkInDate || "").trim() ||
+        (agentResult.lodgingSummary.checkOutDate || "").trim() ||
+        agentResult.lodgingSummary.nights
+      );
+      sections.push(
+        "<section class=\"roadbook-section\">" +
+        "<h3>住宿摘要</h3>" +
+        "<p><strong>酒店：</strong>" + escapeHtml(agentResult.lodgingSummary.hotelName) + "</p>" +
+        (agentResult.lodgingSummary.formattedAddress
+          ? ("<p><strong>地址：</strong>" + escapeHtml(agentResult.lodgingSummary.formattedAddress) + "</p>")
+          : "") +
+        (hasDateInfo
+          ? ("<p><strong>日期：</strong>" +
+            escapeHtml(agentResult.lodgingSummary.checkInDate || "") +
+            " ~ " +
+            escapeHtml(agentResult.lodgingSummary.checkOutDate || "") +
+            (agentResult.lodgingSummary.nights ? ("（" + agentResult.lodgingSummary.nights + " 晚）") : "") +
+            "</p>")
+          : "") +
         "</section>"
       );
     }
@@ -617,6 +880,83 @@
       );
     }
 
+    var dailyPlans = Array.isArray(agentResult.dailyPlans) ? agentResult.dailyPlans : [];
+    if (dailyPlans.length) {
+      var dailyHtml = dailyPlans.map(function (dayPlan) {
+        var segmentHtml = (Array.isArray(dayPlan.segments) ? dayPlan.segments : []).map(function (segment) {
+          if (segment.type === "visit") {
+            return "<li><strong>游览</strong> " + escapeHtml(segment.placeName) +
+              (segment.visitTimeRange ? ("（" + escapeHtml(segment.visitTimeRange) + "）") : "") +
+              "</li>";
+          }
+          return "<li><strong>交通</strong> " + escapeHtml(segment.from) + " → " + escapeHtml(segment.to) +
+            (segment.durationRange ? ("（" + escapeHtml(segment.durationRange) + "）") : "") +
+            "</li>";
+        }).join("");
+        return (
+          "<article class=\"roadbook-step\">" +
+          "<h4>Day " + dayPlan.day + (dayPlan.date ? (" · " + escapeHtml(dayPlan.date)) : "") + "</h4>" +
+          "<ul>" + segmentHtml + "</ul>" +
+          "</article>"
+        );
+      }).join("");
+      sections.push(
+        "<section class=\"roadbook-section\">" +
+        "<h3>按日行程（酒店闭环）</h3>" +
+        dailyHtml +
+        "</section>"
+      );
+    }
+
+    if (agentResult.validation) {
+      var validation = agentResult.validation;
+      var warnings = Array.isArray(validation.warnings) ? validation.warnings : [];
+      var lodgingWarnings = Array.isArray(validation.lodgingWarnings) ? validation.lodgingWarnings : [];
+      var excluded = Array.isArray(validation.excludedPlaces) ? validation.excludedPlaces : [];
+      var timeInfo = validation.timeFeasibility || {};
+      sections.push(
+        "<section class=\"roadbook-section\">" +
+        "<h3>行程校验</h3>" +
+        "<p><strong>时间可行性：</strong>" +
+        (timeInfo.feasible ? "可行" : "可能超载") +
+        (timeInfo.reason ? (" - " + escapeHtml(timeInfo.reason)) : "") +
+        "</p>" +
+        (excluded.length
+          ? ("<p><strong>已排除景点：</strong></p><ul>" + excluded.map(function (item) {
+              return "<li>" + escapeHtml(item.name) + "：" + escapeHtml(item.reason || "归属不匹配") + "</li>";
+            }).join("") + "</ul>")
+          : "") +
+        (lodgingWarnings.length
+          ? ("<p><strong>酒店相关提醒：</strong></p><ul>" + lodgingWarnings.map(function (item) {
+              return "<li>" + escapeHtml(item) + "</li>";
+            }).join("") + "</ul>")
+          : "") +
+        (warnings.length
+          ? ("<p><strong>待核实提醒：</strong></p><ul>" + warnings.map(function (item) {
+              return "<li>" + escapeHtml(item) + "</li>";
+            }).join("") + "</ul>")
+          : "") +
+        "</section>"
+      );
+    }
+
+    if (Array.isArray(agentResult.alternativeProposals) && agentResult.alternativeProposals.length) {
+      var proposals = agentResult.alternativeProposals.map(function (item) {
+        return (
+          "<article class=\"roadbook-step\">" +
+          "<h4>" + escapeHtml(item.title || "替代方案") + "</h4>" +
+          (item.days ? ("<p>建议天数：" + escapeHtml(String(item.days)) + "</p>") : "") +
+          (Array.isArray(item.places) ? ("<p>景点：" + escapeHtml(item.places.join("、")) + "</p>") : "") +
+          (item.summary ? ("<p>" + escapeHtml(item.summary) + "</p>") : "") +
+          "</article>"
+        );
+      }).join("");
+      sections.push(
+        "<section class=\"roadbook-section\">" +
+        "<h3>替代方案</h3>" + proposals + "</section>"
+      );
+    }
+
     var precautions = Array.isArray(agentResult.precautions) ? agentResult.precautions : [];
     if (precautions.length) {
       sections.push(
@@ -633,14 +973,29 @@
 
     if (!sections.length) {
       ui.itineraryResult.innerHTML = "<p>模型未返回有效路书，请重试或检查 API 配置。</p>";
+      ui.downloadRoadbookBtn.classList.add("hidden");
+      state.lastRoadbookExport = null;
       return;
     }
 
     ui.itineraryResult.innerHTML = sections.join("");
+    state.lastRoadbookExport = {
+      country: country,
+      city: city,
+      summary: agentResult.summary || "",
+      routeStrategy: agentResult.routeStrategy || "",
+      lodgingSummary: agentResult.lodgingSummary || null,
+      dailyPlans: Array.isArray(agentResult.dailyPlans) ? agentResult.dailyPlans : [],
+      validation: agentResult.validation || null,
+      precautions: Array.isArray(agentResult.precautions) ? agentResult.precautions : [],
+    };
+    ui.downloadRoadbookBtn.classList.remove("hidden");
   }
 
   function resetItineraryPanel() {
     ui.itineraryResult.innerHTML = ITINERARY_PLACEHOLDER;
+    ui.downloadRoadbookBtn.classList.add("hidden");
+    state.lastRoadbookExport = null;
   }
 
   function mergePlacesWithLlmInsights(places) {
@@ -674,20 +1029,21 @@
       return;
     }
 
-    var country = getCountryValue();
-    var city = getCityValue();
-    var totalDays = Number(ui.daysInput.value);
-    var rawPlaces = collectPlacesFromGrid();
+    var tripInput = collectAllTripInput();
+    var country = tripInput.country;
+    var city = tripInput.city;
+    var totalDays = Number(tripInput.totalDays);
+    var rawPlaces = tripInput.places;
     var baseUrl = ui.llmBaseUrlInput.value.trim();
     var apiKey = ui.llmApiKeyInput.value.trim();
     var model = pickLlmModelValue();
 
     if (!country || !city) {
-      updateStatus("请先填写目标国家和城市。", true);
+      updateStatus("请至少填写一个国家和城市（取首个城市做分析锚点）。", true);
       return;
     }
     if (!rawPlaces.length) {
-      updateStatus("请先填写景点后再做 LLM 分析。", true);
+      updateStatus("请先填写点位后再做 LLM 分析。", true);
       return;
     }
     if (!baseUrl || !apiKey || !model) {
@@ -751,7 +1107,7 @@
   }
 
   async function agentPlanWithTools() {
-    var tripInput = getCommonTripInput();
+    var tripInput = collectAllTripInput();
     var country = tripInput.country;
     var city = tripInput.city;
     var totalDays = tripInput.totalDays;
@@ -762,8 +1118,8 @@
     var llmApiKey = ui.llmApiKeyInput.value.trim();
     var llmModel = pickLlmModelValue();
 
-    if (!country || !city) {
-      updateStatus("请先填写目标国家和城市。", true);
+    if (!tripInput.destinations.length) {
+      updateStatus("请先填写目的地层级（国家/城市/点位）。", true);
       return;
     }
     if (!Number.isFinite(totalDays) || totalDays <= 0) {
@@ -771,7 +1127,7 @@
       return;
     }
     if (!places.length) {
-      updateStatus("请先填写景点列表。", true);
+      updateStatus("请先填写点位列表。", true);
       return;
     }
     if (!mapsApiKey) {
@@ -784,8 +1140,12 @@
     }
 
     updateStatus("正在进行 Agent 智能规划（LLM + Google Maps工具）...", false);
+    setLayoutMode("roadbook");
+    setPlanningLoading(true);
+    setPlanProgressVisible(true);
+    updatePlanProgress(3, "准备请求...");
     try {
-      var response = await fetch("/api/agent/plan", {
+      var response = await fetch("/api/agent/plan/stream", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -796,6 +1156,8 @@
           totalDays: totalDays,
           visitMinutes: visitMinutes,
           places: places,
+          destinations: tripInput.destinations,
+          lodging: tripInput.lodging,
           llmBaseUrl: llmBaseUrl,
           llmApiKey: llmApiKey,
           llmModel: llmModel,
@@ -808,7 +1170,58 @@
         throw new Error("Agent 规划失败(" + response.status + "): " + errText);
       }
 
-      var data = await response.json();
+      if (!response.body) {
+        throw new Error("浏览器不支持流式响应，请刷新后重试");
+      }
+
+      var reader = response.body.getReader();
+      var decoder = new TextDecoder();
+      var buffer = "";
+      var data = null;
+
+      while (true) {
+        var chunkResult = await reader.read();
+        if (chunkResult.done) {
+          break;
+        }
+        buffer += decoder.decode(chunkResult.value, { stream: true });
+        var lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+        lines.forEach(function (line) {
+          var text = line.trim();
+          if (!text) {
+            return;
+          }
+          var msg;
+          try {
+            msg = JSON.parse(text);
+          } catch (err) {
+            return;
+          }
+          if (msg.type === "progress") {
+            var stage = msg.message || msg.stage || "处理中...";
+            var percent = Number(msg.percent);
+            if (!Number.isFinite(percent)) {
+              percent = 10;
+            }
+            updatePlanProgress(percent, stage);
+            updateStatus(stage, false);
+            return;
+          }
+          if (msg.type === "error") {
+            throw new Error(msg.error || "规划失败");
+          }
+          if (msg.type === "result") {
+            data = msg.data || null;
+          }
+        });
+      }
+
+      if (!data) {
+        throw new Error("未收到有效规划结果");
+      }
+
+      updatePlanProgress(100, "路书生成完成");
       var planData = Array.isArray(data.planData) ? data.planData : [];
       state.places = Array.isArray(data.enrichedPlaces) ? data.enrichedPlaces : places;
       renderPlacesList();
@@ -818,15 +1231,25 @@
         placeSpotlights: data.placeSpotlights,
         roadbook: data.roadbook,
         precautions: data.precautions,
+        lodgingSummary: data.lodgingSummary,
+        dailyPlans: data.dailyPlans,
+        validation: data.validation,
+        alternativeProposals: data.alternativeProposals,
       }, country, city);
       if (state.mapReady) {
-        await renderRouteOnMap(planData, country, city);
+        await renderRouteOnMap(planData, country, city, data.lodgingSummary || null);
         updateStatus("智能路书已生成，地图路线已按推荐顺序展示。", false);
       } else {
         updateStatus("智能路书已生成；连接地图后可展示推荐路线。", false);
       }
+      setLayoutMode("roadbook");
     } catch (err) {
       updateStatus("Agent 智能规划失败: " + err.message, true);
+    } finally {
+      setPlanningLoading(false);
+      setTimeout(function () {
+        setPlanProgressVisible(false);
+      }, 1200);
     }
   }
 
@@ -855,7 +1278,6 @@
       state.directionsService = new google.maps.DirectionsService();
       state.mapReady = true;
       state.mapLoading = false;
-      bindMapPickEntryHook();
       updateStatus("Google 地图连接成功，可点击「在地图上标点」。", false);
     };
 
@@ -874,10 +1296,10 @@
   }
 
   function refreshPlacesPreview() {
-    var places = collectPlacesFromGrid();
+    var places = collectAllTripInput().places;
     if (!places.length) {
       state.places = [];
-      ui.placesList.innerHTML = "<p>暂无景点，请先填写景点列表。</p>";
+      ui.placesList.innerHTML = "<p>暂无点位，请先填写点位列表。</p>";
       return;
     }
     state.places = places;
@@ -886,36 +1308,108 @@
 
   function attachEventHandlers() {
     ui.connectMapBtn.addEventListener("click", connectGoogleMap);
-    ui.addPlaceBtn.addEventListener("click", function () {
-      addPlaceRow("", "");
+    ui.addCountryBtn.addEventListener("click", function () {
+      addCountry("");
     });
     ui.markMapBtn.addEventListener("click", function () {
       markOrderedPlacesOnMap();
     });
-    ui.llmBaseUrlInput.addEventListener("change", refreshProviderAndModelByBaseUrl);
-    ui.llmModelSelect.addEventListener("change", function () {
-      if (ui.llmModelSelect.value) {
-        ui.llmModelInput.value = ui.llmModelSelect.value;
-      }
+    ui.downloadRoadbookBtn.addEventListener("click", function () {
+      downloadRoadbookText();
     });
+    ui.llmBaseUrlInput.addEventListener("change", refreshProviderAndModelByBaseUrl);
     ui.llmAnalyzeBtn.addEventListener("click", function () {
       analyzePlacesWithLlm();
     });
     ui.agentPlanBtn.addEventListener("click", function () {
       agentPlanWithTools();
     });
-    ui.placesGridBody.addEventListener("input", refreshPlacesPreview);
-    ui.countryInput.addEventListener("change", syncSelectedCountryCode);
+    ui.destinationsRoot.addEventListener("click", function (event) {
+      var target = event.target;
+      if (target.classList.contains("btn-add-city")) {
+        var countryBlock = target.closest(".destination-country");
+        addCityToCountry(countryBlock, "");
+        refreshPlacesPreview();
+        return;
+      }
+      if (target.classList.contains("btn-remove-country")) {
+        var country = target.closest(".destination-country");
+        if (!country) {
+          return;
+        }
+        if (ui.destinationsRoot.querySelectorAll(".destination-country").length <= 1) {
+          updateStatus("至少保留一个国家块。", false);
+          return;
+        }
+        country.remove();
+        refreshPlacesPreview();
+        return;
+      }
+      if (target.classList.contains("btn-add-place")) {
+        var cityBlock = target.closest(".destination-city");
+        addPlaceRowToCity(cityBlock, "", "", false);
+        refreshPlacesPreview();
+        return;
+      }
+      if (target.classList.contains("btn-remove-city")) {
+        var city = target.closest(".destination-city");
+        var countryBlock = target.closest(".destination-country");
+        if (!city || !countryBlock) {
+          return;
+        }
+        if (countryBlock.querySelectorAll(".destination-city").length <= 1) {
+          updateStatus("每个国家至少保留一个城市块。", false);
+          return;
+        }
+        city.remove();
+        refreshPlacesPreview();
+        return;
+      }
+      if (target.classList.contains("btn-remove-place")) {
+        var row = target.closest(".place-row");
+        var cityContainer = target.closest(".destination-city");
+        if (!row || !cityContainer) {
+          return;
+        }
+        if (cityContainer.querySelectorAll(".place-row").length <= 1) {
+          row.querySelector(".place-name-input").value = "";
+          row.querySelector(".place-address-input").value = "";
+          updateStatus("每个城市至少保留一行点位。", false);
+          refreshPlacesPreview();
+          return;
+        }
+        row.remove();
+        refreshPlaceIndexesWithinCity(cityContainer);
+        refreshPlacesPreview();
+      }
+    });
+    ui.destinationsRoot.addEventListener("input", refreshPlacesPreview);
+    ui.destinationsRoot.addEventListener("focusin", function () {
+      setLayoutMode("input");
+    });
+    ui.llmBaseUrlInput.addEventListener("focus", function () {
+      setLayoutMode("input");
+    });
+    ui.llmApiKeyInput.addEventListener("focus", function () {
+      setLayoutMode("input");
+    });
+    ui.daysInput.addEventListener("focus", function () {
+      setLayoutMode("input");
+    });
+    ui.visitMinutesInput.addEventListener("focus", function () {
+      setLayoutMode("input");
+    });
   }
 
-  function initPlacesGrid() {
-    addPlaceRow("", "");
+  function initDestinations() {
+    addCountry("");
+    refreshPlacesPreview();
   }
 
-  initPlacesGrid();
+  initDestinations();
   resetItineraryPanel();
   refreshPlacesPreview();
-  syncSelectedCountryCode();
+  setLayoutMode("input");
   refreshProviderAndModelByBaseUrl();
   attachEventHandlers();
 }());

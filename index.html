@@ -3,29 +3,18 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>旅行规划 Agent · 内测 v1.0</title>
+  <title>旅行规划 Agent · 内测 v1.1</title>
   <link rel="stylesheet" href="./styles.css" />
 </head>
 <body>
   <header class="topbar">
-    <h1>旅行规划 Agent · 内测 v1.0</h1>
-    <p>输入目的地与景点，在 Google 地图上按顺序标点；配置 LLM 后可进行智能行程规划。</p>
+    <h1>旅行规划 Agent · 内测 v1.1</h1>
+    <p>支持多国家/多城市层级输入与可选酒店锚点；无 LLM 可标点，有 LLM 可生成按日路书。</p>
   </header>
 
-  <main class="layout">
+  <main id="mainLayout" class="layout mode-input-focus">
     <section class="panel controls">
       <h2>参数设置</h2>
-
-      <div class="destination-row">
-        <label>
-          目标国家
-          <input id="countryInput" type="text" placeholder="例如：China" />
-        </label>
-        <label>
-          目标城市
-          <input id="cityInput" type="text" placeholder="例如：Paris" />
-        </label>
-      </div>
 
       <label>
         Google Maps API Key
@@ -33,22 +22,15 @@
       </label>
       <button id="connectMapBtn" type="button">连接 Google 地图</button>
 
-      <h3>景点列表</h3>
-      <div class="places-grid">
-        <div class="places-grid-header">
-          <span class="col-index">#</span>
-          <span class="col-name">景点名</span>
-          <span class="col-address">地址（可选）</span>
-          <span class="col-action"></span>
-        </div>
-        <div id="placesGridBody" class="places-grid-body"></div>
-      </div>
-      <button id="addPlaceBtn" type="button" class="btn-secondary">+ 添加景点</button>
+      <h3>行程目的地与点位</h3>
+      <p class="tips">每行可选择“景点/酒店”，默认是景点；若选酒店，将作为可选酒店锚点使用。</p>
+      <div id="destinationsRoot" class="destinations-root"></div>
+      <button id="addCountryBtn" type="button" class="btn-secondary">+ 添加国家/地区</button>
       <button id="markMapBtn" type="button">在地图上标点</button>
 
-      <p id="statusText" class="status">请填写目的地与景点，连接地图后点击「在地图上标点」。</p>
+      <p id="statusText" class="status">请填写层级目的地与景点，连接地图后点击「在地图上标点」。</p>
 
-      <h3>已解析景点</h3>
+      <h3>已解析点位</h3>
       <div id="placesList" class="places-list"></div>
 
       <h3>LLM 配置（智能规划必需）</h3>
@@ -68,10 +50,6 @@
         LLM Model（自动识别下拉）
         <select id="llmModelSelect"></select>
       </label>
-      <label>
-        LLM Model（手动覆盖，可选）
-        <input id="llmModelInput" type="text" placeholder="默认 qwen-plus" value="qwen-plus" />
-      </label>
       <div class="destination-row">
         <label>
           游玩天数
@@ -84,6 +62,15 @@
       </div>
       <button id="llmAnalyzeBtn" type="button">先用 LLM 分析景点时长</button>
       <button id="agentPlanBtn" type="button">Agent 智能规划（LLM + Google Maps）</button>
+      <div id="planProgressWrap" class="plan-progress hidden">
+        <div class="plan-progress-head">
+          <span id="planProgressStage">等待开始</span>
+          <span id="planProgressPercent">0%</span>
+        </div>
+        <div class="plan-progress-track">
+          <div id="planProgressFill" class="plan-progress-fill"></div>
+        </div>
+      </div>
     </section>
 
     <section class="panel map-panel">
@@ -94,6 +81,7 @@
 
     <section class="panel itinerary">
       <h2>智能路书</h2>
+      <button id="downloadRoadbookBtn" type="button" class="btn-secondary btn-inline hidden">导出路书 TXT</button>
       <div id="itineraryResult" class="itinerary-result">
         <p class="itinerary-placeholder">填写 LLM 配置并点击「Agent 智能规划」后，路书将显示在这里。</p>
       </div>

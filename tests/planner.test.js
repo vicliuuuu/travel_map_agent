@@ -110,6 +110,46 @@ test("route stops keeps day and visit sequence", () => {
   assert.deepEqual(stops.map((s) => s.day), [1, 1, 2]);
 });
 
+test("flattenDestinations preserves city and country context", () => {
+  const places = planner.flattenDestinations([
+    {
+      country: "China",
+      cities: [
+        {
+          city: "Beijing",
+          places: [{ name: "故宫", address: "", isHotel: false }],
+        },
+        {
+          city: "Tianjin",
+          places: [{ name: "天津之眼", address: "", isHotel: true }],
+        },
+      ],
+    },
+  ]);
+
+  assert.equal(places.length, 2);
+  assert.equal(places[0].declaredCountry, "China");
+  assert.equal(places[0].declaredCity, "Beijing");
+  assert.equal(places[1].declaredCity, "Tianjin");
+  assert.equal(places[1].isHotel, true);
+});
+
+test("calculateNights and inferTotalDaysFromLodging", () => {
+  const nights = planner.calculateNights("2026-08-01", "2026-08-04");
+  assert.equal(nights, 3);
+
+  const days = planner.inferTotalDaysFromLodging(
+    {
+      hotel: {
+        checkInDate: "2026-08-01",
+        checkOutDate: "2026-08-05",
+      },
+    },
+    2
+  );
+  assert.equal(days, 4);
+});
+
 test("place specific duration overrides default duration", () => {
   const itinerary = planner.buildItinerary({
     city: "Beijing",

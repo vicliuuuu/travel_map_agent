@@ -92,6 +92,137 @@
     return places;
   }
 
+  function normalizeDestinationPlace(place, country, city, placeIndex) {
+    var name = String((place && place.name) || "").trim();
+    var addressExtra = String(
+      (place && (place.addressExtra || place.address)) || ""
+    ).trim();
+    if (!name && !addressExtra) {
+      return null;
+    }
+
+    var displayName = name || ("景点 #" + (placeIndex + 1));
+    var durationCandidate = Number(place && (place.durationMin || place.suggestedDurationMin));
+    var durationMin = Number.isFinite(durationCandidate) && durationCandidate > 0
+      ? Math.floor(durationCandidate)
+      : null;
+    var isHotel = Boolean(place && (place.isHotel || place.type === "hotel"));
+
+    return {
+      placeId: "dest-" + country + "-" + city + "-" + (placeIndex + 1),
+      name: displayName,
+      addressExtra: addressExtra,
+      address: formatPlaceDisplayAddress(addressExtra, city, country),
+      geocodeQuery: buildGeocodeQuery(
+        {
+          name: displayName,
+          addressExtra: addressExtra,
+        },
+        country,
+        city
+      ),
+      declaredCountry: country,
+      declaredCity: city,
+      isHotel: isHotel,
+      durationMin: durationMin,
+      suggestedDurationMin: durationMin,
+      selected: true,
+      location: null,
+      resolvedAddress: "",
+      resolvedLat: null,
+      resolvedLng: null,
+    };
+  }
+
+  function flattenDestinations(destinations) {
+    var safeDestinations = Array.isArray(destinations) ? destinations : [];
+    var places = [];
+
+    safeDestinations.forEach(function (destination) {
+      var country = String((destination && destination.country) || "").trim();
+      if (!country) {
+        return;
+      }
+      var cities = Array.isArray(destination.cities) ? destination.cities : [];
+      cities.forEach(function (cityBlock) {
+        var city = String((cityBlock && cityBlock.city) || "").trim();
+        if (!city) {
+          return;
+        }
+        var cityPlaces = Array.isArray(cityBlock.places) ? cityBlock.places : [];
+        cityPlaces.forEach(function (rawPlace, index) {
+          var normalized = normalizeDestinationPlace(rawPlace, country, city, index);
+          if (normalized) {
+            places.push(normalized);
+          }
+        });
+      });
+    });
+
+    return places;
+  }
+
+  function normalizeLegacyInputToDestinations(country, city, places) {
+    var safeCountry = String(country || "").trim();
+    var safeCity = String(city || "").trim();
+    var safePlaces = Array.isArray(places) ? places : [];
+    return [
+      {
+        country: safeCountry,
+        cities: [
+          {
+            city: safeCity,
+            places: safePlaces.map(function (place) {
+              return {
+                name: String((place && place.name) || "").trim(),
+                address: String(
+                  (place && (place.addressExtra || place.address)) || ""
+                ).trim(),
+                isHotel: Boolean(place && place.isHotel),
+                durationMin: Number(place && (place.durationMin || place.suggestedDurationMin)) || null,
+              };
+            }),
+          },
+        ],
+      },
+    ];
+  }
+
+  function parseIsoDateToUtcMidnight(dateText) {
+    var text = String(dateText || "").trim();
+    var match = text.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (!match) {
+      return null;
+    }
+    return Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+  }
+
+  function calculateNights(checkInDate, checkOutDate) {
+    var checkIn = parseIsoDateToUtcMidnight(checkInDate);
+    var checkOut = parseIsoDateToUtcMidnight(checkOutDate);
+    if (checkIn === null || checkOut === null) {
+      return null;
+    }
+    var diff = checkOut - checkIn;
+    if (diff <= 0) {
+      return null;
+    }
+    return Math.floor(diff / (24 * 60 * 60 * 1000));
+  }
+
+  function inferTotalDaysFromLodging(lodging, fallbackDays) {
+    var safeFallback = normalizeDays(fallbackDays);
+    var hotel = lodging && lodging.hotel ? lodging.hotel : null;
+    if (!hotel) {
+      return safeFallback;
+    }
+    var nights = calculateNights(hotel.checkInDate, hotel.checkOutDate);
+    if (!Number.isFinite(nights) || nights <= 0) {
+      return safeFallback;
+    }
+    return nights;
+  }
+
   function parseManualPlaces(rawInput, country, city) {
     var text = typeof rawInput === "string" ? rawInput : "";
     var lines = text
@@ -252,6 +383,10 @@
     parsePlaceRows: parsePlaceRows,
     buildGeocodeQuery: buildGeocodeQuery,
     formatPlaceDisplayAddress: formatPlaceDisplayAddress,
+    flattenDestinations: flattenDestinations,
+    normalizeLegacyInputToDestinations: normalizeLegacyInputToDestinations,
+    calculateNights: calculateNights,
+    inferTotalDaysFromLodging: inferTotalDaysFromLodging,
   };
 
   if (typeof module !== "undefined" && module.exports) {

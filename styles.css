@@ -27,9 +27,34 @@ body {
 
 .layout {
   display: grid;
-  grid-template-columns: 360px 1fr 420px;
+  grid-template-columns: minmax(300px, 0.9fr) minmax(520px, 1.6fr) minmax(300px, 0.9fr);
+  grid-template-areas: "controls map itinerary";
   gap: 12px;
   padding: 12px;
+}
+
+.controls {
+  grid-area: controls;
+}
+
+.map-panel {
+  grid-area: map;
+}
+
+.itinerary {
+  grid-area: itinerary;
+}
+
+.layout.mode-input-focus {
+  grid-template-areas: "map controls itinerary";
+}
+
+.layout.mode-map-focus {
+  grid-template-areas: "controls map itinerary";
+}
+
+.layout.mode-roadbook-focus {
+  grid-template-areas: "controls itinerary map";
 }
 
 .panel {
@@ -71,6 +96,39 @@ body {
   margin-bottom: 0;
 }
 
+.destinations-root {
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  padding: 8px;
+  margin-bottom: 10px;
+  background: #f8fafc;
+}
+
+.destination-country {
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 8px;
+  margin-bottom: 8px;
+}
+
+.destination-city {
+  border: 1px dashed #bfdbfe;
+  border-radius: 8px;
+  background: #f8fbff;
+  padding: 8px;
+  margin: 8px 0;
+}
+
+.destination-row .btn-secondary {
+  margin-top: 22px;
+  margin-bottom: 0;
+}
+
+.hidden {
+  display: none !important;
+}
+
 .places-grid {
   border: 1px solid #e2e8f0;
   border-radius: 6px;
@@ -81,10 +139,14 @@ body {
 .places-grid-header,
 .places-grid-row {
   display: grid;
-  grid-template-columns: 36px 1fr 1fr 36px;
+  grid-template-columns: 36px 1fr 1fr 88px 36px;
   gap: 6px;
   align-items: center;
   padding: 8px;
+}
+
+.city-places-grid-body {
+  display: block;
 }
 
 .places-grid-header {
@@ -116,6 +178,26 @@ body {
   text-align: center;
   font-size: 13px;
   color: #64748b;
+}
+
+.col-type {
+  text-align: center;
+  font-size: 12px;
+  color: #64748b;
+}
+
+.place-type-cell {
+  display: block;
+}
+
+.place-type-select {
+  width: 100%;
+  margin: 0;
+  padding: 6px 4px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  font-size: 12px;
+  background: #ffffff;
 }
 
 button {
@@ -286,8 +368,54 @@ button[disabled] {
   color: #64748b;
 }
 
+.btn-inline {
+  width: auto;
+  min-width: 140px;
+  margin-bottom: 10px;
+}
+
+.plan-progress {
+  margin-top: 6px;
+  padding: 8px;
+  border: 1px solid #bfdbfe;
+  border-radius: 6px;
+  background: #eff6ff;
+}
+
+.plan-progress-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+  color: #1e3a8a;
+  margin-bottom: 6px;
+}
+
+.plan-progress-track {
+  width: 100%;
+  height: 8px;
+  border-radius: 999px;
+  background: #dbeafe;
+  overflow: hidden;
+}
+
+.plan-progress-fill {
+  width: 0%;
+  height: 100%;
+  background: linear-gradient(90deg, #2563eb, #1d4ed8);
+  transition: width 0.2s ease;
+}
+
 @media (max-width: 1200px) {
   .layout {
     grid-template-columns: 1fr;
+    grid-template-areas:
+      "controls"
+      "map"
+      "itinerary";
+  }
+
+  .btn-inline {
+    width: 100%;
   }
 }

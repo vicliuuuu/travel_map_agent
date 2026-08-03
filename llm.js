@@ -7,7 +7,16 @@
 
   var PROVIDER_MODELS = {
     openai: ["gpt-4.1-mini", "gpt-4o-mini", "gpt-4o", "o4-mini"],
-    qwen: ["qwen-max", "qwen-plus", "qwen-turbo", "qwen3-32b"],
+    qwen: [
+      "qwen-plus",
+      "qwen-max",
+      "qwen-turbo",
+      "qwen-plus-latest",
+      "qwen-max-latest",
+      "qwen3-plus",
+      "qwen3-max",
+      "qwen3-32b",
+    ],
     deepseek: ["deepseek-chat", "deepseek-reasoner"],
     openrouter: ["openai/gpt-4o-mini", "qwen/qwen-2.5-72b-instruct", "anthropic/claude-3.5-sonnet"],
     siliconflow: ["Qwen/Qwen2.5-72B-Instruct", "deepseek-ai/DeepSeek-V3", "meta-llama/Meta-Llama-3.1-70B-Instruct"],
@@ -148,6 +157,101 @@
       });
   }
 
+  function parseValidation(raw) {
+    var source = raw && typeof raw === "object" ? raw : {};
+    var timeFeasibilityRaw = source.timeFeasibility && typeof source.timeFeasibility === "object"
+      ? source.timeFeasibility
+      : {};
+    return {
+      timeFeasibility: {
+        feasible: Boolean(timeFeasibilityRaw.feasible),
+        requestedDays: Number(timeFeasibilityRaw.requestedDays) || null,
+        suggestedDays: Number(timeFeasibilityRaw.suggestedDays) || null,
+        reason: String(timeFeasibilityRaw.reason || ""),
+      },
+      lodgingWarnings: (Array.isArray(source.lodgingWarnings) ? source.lodgingWarnings : [])
+        .map(function (item) { return String(item || "").trim(); })
+        .filter(function (item) { return !!item; }),
+      warnings: (Array.isArray(source.warnings) ? source.warnings : [])
+        .map(function (item) { return String(item || "").trim(); })
+        .filter(function (item) { return !!item; }),
+      excludedPlaces: (Array.isArray(source.excludedPlaces) ? source.excludedPlaces : [])
+        .map(function (item) {
+          if (!item || typeof item !== "object") {
+            return null;
+          }
+          var name = String(item.name || "").trim();
+          if (!name) {
+            return null;
+          }
+          return {
+            name: name,
+            declaredCity: String(item.declaredCity || ""),
+            declaredCountry: String(item.declaredCountry || ""),
+            reason: String(item.reason || ""),
+            resolvedAddress: String(item.resolvedAddress || ""),
+          };
+        })
+        .filter(function (item) { return !!item; }),
+    };
+  }
+
+  function parseDailyPlans(rawList) {
+    return (Array.isArray(rawList) ? rawList : [])
+      .map(function (item, index) {
+        if (!item || typeof item !== "object") {
+          return null;
+        }
+        var segments = Array.isArray(item.segments) ? item.segments : [];
+        return {
+          day: Number(item.day) || (index + 1),
+          date: String(item.date || ""),
+          hotelName: String(item.hotelName || ""),
+          segments: segments.map(function (segment) {
+            if (!segment || typeof segment !== "object") {
+              return null;
+            }
+            var type = String(segment.type || "").toLowerCase();
+            if (type === "visit") {
+              return {
+                type: "visit",
+                placeName: String(segment.placeName || ""),
+                visitTimeRange: String(segment.visitTimeRange || ""),
+                visitDurationMin: clampDuration(segment.visitDurationMin, 90),
+              };
+            }
+            if (type === "transit") {
+              return {
+                type: "transit",
+                from: String(segment.from || ""),
+                to: String(segment.to || ""),
+                durationRange: String(segment.durationRange || ""),
+                durationMin: Number.isFinite(Number(segment.durationMin))
+                  ? Math.max(1, Math.floor(Number(segment.durationMin)))
+                  : null,
+                distanceText: String(segment.distanceText || ""),
+                note: String(segment.note || ""),
+              };
+            }
+            return null;
+          }).filter(function (segment) { return !!segment; }),
+        };
+      })
+      .filter(function (item) { return !!item; });
+  }
+
+  function parseLodgingSummary(raw) {
+    var source = raw && typeof raw === "object" ? raw : {};
+    return {
+      hotelName: String(source.hotelName || ""),
+      formattedAddress: String(source.formattedAddress || ""),
+      checkInDate: String(source.checkInDate || ""),
+      checkOutDate: String(source.checkOutDate || ""),
+      nights: Number(source.nights) || null,
+      note: String(source.note || ""),
+    };
+  }
+
   function parseAnalysisPlaces(rawList) {
     return (Array.isArray(rawList) ? rawList : [])
       .map(function (item) {
@@ -206,6 +310,10 @@
       roadbook: parseRoadbook(parsed.roadbook),
       precautions: parsePrecautions(parsed.precautions),
       places: places,
+      lodgingSummary: parseLodgingSummary(parsed.lodgingSummary),
+      dailyPlans: parseDailyPlans(parsed.dailyPlans),
+      validation: parseValidation(parsed.validation),
+      alternativeProposals: Array.isArray(parsed.alternativeProposals) ? parsed.alternativeProposals : [],
     };
   }
 
@@ -219,6 +327,10 @@
       placeSpotlights: agentPlan.placeSpotlights,
       roadbook: agentPlan.roadbook,
       precautions: agentPlan.precautions,
+      lodgingSummary: agentPlan.lodgingSummary,
+      dailyPlans: agentPlan.dailyPlans,
+      validation: agentPlan.validation,
+      alternativeProposals: agentPlan.alternativeProposals,
     };
   }
 
@@ -248,14 +360,18 @@
   function buildAgentSystemPrompt() {
     return [
       "你是资深旅行规划师与路书撰写专家。",
-      "用户只听说过景点名字，不熟悉当地，也不知道合理的游玩顺序——顺序规划是你的核心职责。",
+      "你必须严格基于地理工具结果与常识，不得编造预约渠道、内部可参观区域或不存在的景点事实。",
       "",
-      "工作原则：",
-      "1) 先汇总用户提到的全部景点，逐一给出通俗介绍，帮助用户快速建立认知；",
-      "2) 必须调用 geocode_place 解析每个景点位置，并调用 get_travel_time 查询相邻景点真实通勤时间；",
-      "3) 结合 Google Maps 真实路程与常见旅游攻略经验，按「尽量不走回头路」策略确定游览顺序；",
-      "4) 输出完整路书：使用时间段/范围描述（如「建议游玩 2-3 小时」「车程约 25-35 分钟」），不要精确到几点几分；",
-      "5) 根据目的地给出实用注意事项（地形、气候、安全、文化礼仪等），要具体、可执行。",
+      "v1.1 规划纪律：",
+      "1) 输入是 destinations（多国家/多城市）与 lodging（单酒店，可选）结构；",
+      "2) 先 geocode 酒店与全部景点，再做顺序与路书；",
+      "2.1) 酒店只作为位置锚点，不使用入住/退房日期参与规划；",
+      "3) 景点若与其声明城市/国家不匹配，放入 validation.excludedPlaces，不得硬塞进路书；",
+      "4) 每日行程必须闭环：酒店 -> 景点 -> ... -> 酒店；",
+      "5) 先忽略用户填写的 totalDays，先基于真实路程与游览时长给出自然可行天数；",
+      "6) 再与用户 totalDays 对比：若用户天数偏少，必须删减景点并给出替代方案；若用户天数偏多，允许压缩天数；",
+      "7) 对时间不可行方案必须给出 validation.timeFeasibility 与 alternativeProposals；",
+      "8) 时间只用范围描述，不精确到具体分钟时刻。",
       "",
       "最终只输出 JSON，不要 markdown 包裹。",
     ].join("\n");
@@ -266,11 +382,22 @@
     var country = String(input.country || "");
     var places = Array.isArray(input.places) ? input.places : [];
     var days = Number(input.totalDays || 1);
+    var destinations = Array.isArray(input.destinations) ? input.destinations : [];
+    var lodging = input.lodging && typeof input.lodging === "object" ? input.lodging : null;
+    var destinationText = JSON.stringify(destinations, null, 2);
+    var lodgingText = JSON.stringify(lodging || {}, null, 2);
 
     return [
-      "请为以下旅行需求生成智能路书。",
+      "请为以下旅行需求生成 v1.1 智能路书。",
       "",
-      "【目的地】",
+      "【输入结构】",
+      "destinations（多国家/多城市）:",
+      destinationText,
+      "",
+      "lodging（v1.1 单酒店，可选）:",
+      lodgingText,
+      "",
+      "兼容字段（旧版）:",
       "国家: " + country,
       "城市: " + city,
       "计划游玩天数: " + days,
@@ -282,13 +409,19 @@
       }).join("\n"),
       "",
       "【工具使用要求】",
+      "- 若提供酒店，则先 geocode 酒店",
       "- 对每个景点调用 geocode_place（placeName 必填，可附 placeAddress）",
-      "- 按你初步判断的顺序，对相邻景点调用 get_travel_time 获取真实驾驶时长",
+      "- 若提供酒店，每天应包含 酒店->首站 与 末站->酒店 的 get_travel_time",
+      "- 按你判断的顺序，对相邻景点调用 get_travel_time 获取真实驾驶时长",
       "- 若某段路程查询失败，在路书中注明并给出保守估计",
       "",
-      "【规划策略（当前版本）】",
+      "【规划策略（v1.1）】",
       "- 核心策略：尽量不走回头路，减少折返",
-      "- 可综合景点开放时间、地理位置聚类、常见攻略动线，但必须在 routeStrategy 中解释",
+      "- 可综合地理聚类、跨城交通成本、酒店往返成本，但必须在 routeStrategy 中解释",
+      "- 行程天数评估只以 totalDays 与景点/路程为准，不依赖酒店入住退房日期",
+      "- 先做“自然可行规划”：暂时忽略用户 totalDays，先求一个真实可执行版本",
+      "- 再做“天数对齐”：将自然可行规划与用户 totalDays 对比后再调整",
+      "- 时间超载时不得硬输出看似完整但不可执行的路书",
       "",
       "【输出 JSON Schema】",
       "{",
@@ -306,6 +439,26 @@
       "    }",
       "  ],",
       '  "recommendedOrder": ["景点A","景点B"],',
+      '  "lodgingSummary": {',
+      '    "hotelName": "酒店名",',
+      '    "formattedAddress": "酒店解析地址",',
+      '    "checkInDate": "",',
+      '    "checkOutDate": "",',
+      '    "nights": null,',
+      '    "note": "全程固定入住，每日返回酒店"',
+      "  },",
+      '  "dailyPlans": [',
+      "    {",
+      '      "day": 1,',
+      '      "date": "YYYY-MM-DD",',
+      '      "hotelName": "酒店名",',
+      '      "segments": [',
+      '        {"type":"transit","from":"酒店","to":"景点A","durationRange":"约20-30分钟","durationMin":25},',
+      '        {"type":"visit","placeName":"景点A","visitTimeRange":"建议2-3小时","visitDurationMin":150},',
+      '        {"type":"transit","from":"景点A","to":"酒店","durationRange":"约25-35分钟","durationMin":30}',
+      "      ]",
+      "    }",
+      "  ],",
       '  "roadbook": [',
       "    {",
       '      "step": 1,',
@@ -326,6 +479,17 @@
       '    "针对该目的地的注意事项1",',
       '    "注意事项2"',
       "  ],",
+      '  "validation": {',
+      '    "timeFeasibility": {"feasible": true, "requestedDays": 3, "suggestedDays": 3, "reason": "..."},',
+      '    "lodgingWarnings": ["跨城日往返较远"],',
+      '    "excludedPlaces": [',
+      '      {"name":"景点X","declaredCity":"Beijing","declaredCountry":"China","reason":"解析地址在天津","resolvedAddress":"..."}',
+      "    ],",
+      '    "warnings": ["事实待核实提醒"]',
+      "  },",
+      '  "alternativeProposals": [',
+      '    {"title":"方案A","days":2,"places":["A","B"],"summary":"..."}',
+      "  ],",
       '  "places": [',
       '    {"name":"景点名","suggestedDurationMin":120,"priority":"high|medium|low","reason":"简短理由"}',
       "  ]",
@@ -335,6 +499,9 @@
       "- placeSpotlights 必须覆盖用户提到的每一个景点",
       "- recommendedOrder 与 roadbook 站点顺序一致",
       "- roadbook 最后一站的 travelToNext 设为 null 或省略",
+      "- dailyPlans 必须覆盖全部游玩日；若提供酒店则每天首段来自酒店、末段返回酒店",
+      "- 必须先输出自然可行建议天数（suggestedDays），再判断是否需要删减景点或压缩天数",
+      "- validation.excludedPlaces 里的景点不得出现在 recommendedOrder 与 roadbook",
       "- precautions 至少 2 条，结合目的地实际情况（如重庆山路/欧洲防盗/高原反应等）",
       "- suggestedDurationMin、durationMin 为整数分钟；priority 只能是 high/medium/low",
     ].join("\n");
