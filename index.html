@@ -83,8 +83,12 @@
 
     <section class="panel map-panel">
       <h2>Google 地图标点展示</h2>
+      <div id="routeModeToggle" class="route-mode-toggle hidden">
+        <button id="routeModeDrivingBtn" type="button" class="route-mode-btn active" data-mode="driving">自驾路线</button>
+        <button id="routeModeTransitBtn" type="button" class="route-mode-btn" data-mode="transit">公交路线</button>
+      </div>
       <div id="map" class="map"></div>
-      <p class="tips">无 LLM 时仅按输入顺序标点（1、2、3…）；智能规划后展示完整路线。</p>
+      <p class="tips">无 LLM 时仅按输入顺序标点（1、2、3…）；智能规划后展示完整路线，可切换自驾/公交视图。</p>
     </section>
 
     <section class="panel itinerary">

@@ -12,7 +12,12 @@
     geocoder: null,
     directionsService: null,
     routeRenderers: [],
+    transitRenderers: [],
     routeMarkers: [],
+    currentRouteStops: [],
+    routeMode: "driving",
+    transitComputed: false,
+    transitMissingCount: 0,
   };
 
   var ui = {
@@ -39,6 +44,9 @@
     statusText: document.getElementById("statusText"),
     placesList: document.getElementById("placesList"),
     itineraryResult: document.getElementById("itineraryResult"),
+    routeModeToggle: document.getElementById("routeModeToggle"),
+    routeModeDrivingBtn: document.getElementById("routeModeDrivingBtn"),
+    routeModeTransitBtn: document.getElementById("routeModeTransitBtn"),
   };
 
   var ITINERARY_PLACEHOLDER =
@@ -150,10 +158,160 @@
     });
     state.routeRenderers = [];
 
+    state.transitRenderers.forEach(function (overlay) {
+      overlay.setMap(null);
+    });
+    state.transitRenderers = [];
+
     state.routeMarkers.forEach(function (marker) {
       marker.setMap(null);
     });
     state.routeMarkers = [];
+
+    state.currentRouteStops = [];
+    state.transitComputed = false;
+    state.transitMissingCount = 0;
+    state.routeMode = "driving";
+    showRouteModeToggle(false);
+  }
+
+  function showRouteModeToggle(visible) {
+    if (!ui.routeModeToggle) {
+      return;
+    }
+    ui.routeModeToggle.classList.toggle("hidden", !visible);
+  }
+
+  function updateRouteModeButtons() {
+    var isTransit = state.routeMode === "transit";
+    if (ui.routeModeDrivingBtn) {
+      ui.routeModeDrivingBtn.classList.toggle("active", !isTransit);
+    }
+    if (ui.routeModeTransitBtn) {
+      ui.routeModeTransitBtn.classList.toggle("active", isTransit);
+    }
+  }
+
+  // 只切换显隐，不重新计算：自驾图层与公交图层各自持有 setMap 能力（DirectionsRenderer / Polyline 均支持）。
+  function applyRouteModeVisibility() {
+    var showDriving = state.routeMode !== "transit";
+    state.routeRenderers.forEach(function (overlay) {
+      overlay.setMap(showDriving ? state.map : null);
+    });
+    state.transitRenderers.forEach(function (overlay) {
+      overlay.setMap(showDriving ? null : state.map);
+    });
+  }
+
+  function requestTransitDirections(from, to) {
+    return new Promise(function (resolve, reject) {
+      state.directionsService.route(
+        {
+          origin: from.latLng,
+          destination: to.latLng,
+          travelMode: google.maps.TravelMode.TRANSIT,
+        },
+        function (result, status) {
+          if (status !== "OK") {
+            reject(new Error(status));
+            return;
+          }
+          resolve(result);
+        }
+      );
+    });
+  }
+
+  // 公交路线：transit 模式不支持途经点，故相邻两点逐段查询；无公交数据的段落用灰色虚线兜底，避免断线。
+  async function drawTransitRoute(stops) {
+    var overlays = [];
+    var missing = 0;
+    var i;
+    for (i = 1; i < stops.length; i += 1) {
+      var from = stops[i - 1];
+      var to = stops[i];
+      try {
+        var result = await requestTransitDirections(from, to);
+        var renderer = new google.maps.DirectionsRenderer({
+          map: null,
+          suppressMarkers: true,
+          preserveViewport: true,
+          polylineOptions: {
+            strokeColor: "#059669",
+            strokeOpacity: 0.9,
+            strokeWeight: 5,
+          },
+        });
+        renderer.setDirections(result);
+        overlays.push(renderer);
+      } catch (err) {
+        missing += 1;
+        var dashed = new google.maps.Polyline({
+          map: null,
+          path: [from.latLng, to.latLng],
+          strokeOpacity: 0,
+          icons: [
+            {
+              icon: {
+                path: "M 0,-1 0,1",
+                strokeColor: "#94a3b8",
+                strokeOpacity: 1,
+                strokeWeight: 2,
+                scale: 3,
+              },
+              offset: "0",
+              repeat: "12px",
+            },
+          ],
+        });
+        overlays.push(dashed);
+      }
+    }
+    state.transitRenderers = overlays;
+    state.transitComputed = true;
+    state.transitMissingCount = missing;
+  }
+
+  async function setRouteMode(mode) {
+    if (mode !== "driving" && mode !== "transit") {
+      return;
+    }
+    if (!state.mapReady || state.currentRouteStops.length < 2) {
+      return;
+    }
+    if (mode === state.routeMode && (mode !== "transit" || state.transitComputed)) {
+      return;
+    }
+    if (mode === "transit" && !state.transitComputed) {
+      updateStatus("正在计算公交路线（逐段查询，请稍候）...", false);
+      if (ui.routeModeTransitBtn) {
+        ui.routeModeTransitBtn.disabled = true;
+      }
+      try {
+        await drawTransitRoute(state.currentRouteStops);
+      } catch (err) {
+        updateStatus("公交路线计算失败: " + err.message, true);
+        return;
+      } finally {
+        if (ui.routeModeTransitBtn) {
+          ui.routeModeTransitBtn.disabled = false;
+        }
+      }
+    }
+    state.routeMode = mode;
+    applyRouteModeVisibility();
+    updateRouteModeButtons();
+    if (mode === "transit") {
+      var missing = state.transitMissingCount || 0;
+      updateStatus(
+        missing > 0
+          ? ("已切换到公交路线；其中 " + missing + " 段无公交数据，用灰色虚线示意。")
+          : "已切换到公交路线。",
+        false
+      );
+    } else {
+      updateStatus("已切换到自驾路线。", false);
+    }
   }
 
   function createPlaceRow(nameValue, addressValue, placeTypeValue) {
@@ -535,6 +693,17 @@
     }
   }
 
+  function findPlaceForStop(stopTitle) {
+    var target = String(stopTitle || "").trim().toLowerCase();
+    if (!target) {
+      return null;
+    }
+    var list = Array.isArray(state.places) ? state.places : [];
+    return list.find(function (place) {
+      return String(place && place.name || "").trim().toLowerCase() === target;
+    }) || null;
+  }
+
   async function renderRouteOnMap(planData, country, city, lodgingSummary) {
     if (!state.mapReady) {
       updateStatus("请先连接 Google 地图。", true);
@@ -554,16 +723,23 @@
     var i;
     for (i = 0; i < routeStops.length; i += 1) {
       var stop = routeStops[i];
-      var query = stop.address || window.TravelPlanner.buildGeocodeQuery(
-        {
-          name: stop.title,
-          addressExtra: "",
-        },
-        country,
-        city
-      );
+      // 复用景点自身的 geocodeQuery（含景点名 + 该点所属城市/国家），与「在地图上标点」保持一致，
+      // 避免退回到只有「城市, 国家」的展示地址而把同城景点全部解析到市中心导致重合。
+      var matchedPlace = findPlaceForStop(stop.title);
+      var query = (matchedPlace && matchedPlace.geocodeQuery)
+        ? matchedPlace.geocodeQuery
+        : (window.TravelPlanner.buildGeocodeQuery(
+            {
+              name: stop.title,
+              addressExtra: "",
+            },
+            (matchedPlace && matchedPlace.declaredCountry) || country,
+            (matchedPlace && matchedPlace.declaredCity) || city
+          ));
       var countryCode = window.TravelLocationData
-        ? window.TravelLocationData.getCountryCodeFromInput(stop.country || country || "")
+        ? window.TravelLocationData.getCountryCodeFromInput(
+            (matchedPlace && matchedPlace.declaredCountry) || stop.country || country || ""
+          )
         : "";
       var geo = await geocodePlace(query, countryCode);
       resolvedStops.push({
@@ -630,12 +806,17 @@
       state.routeRenderers.push(renderer);
     }
 
+    state.currentRouteStops = resolvedStops;
+    state.routeMode = "driving";
+    updateRouteModeButtons();
+    showRouteModeToggle(true);
+
     var bounds = new google.maps.LatLngBounds();
     resolvedStops.forEach(function (stop) {
       bounds.extend(stop.latLng);
     });
     state.map.fitBounds(bounds);
-    updateStatus("智能规划完成，路线已展示在地图上。", false);
+    updateStatus("智能规划完成，路线已展示（可切换自驾/公交）。", false);
   }
 
   function renderPlacesList() {
@@ -1448,6 +1629,16 @@
     ui.visitMinutesInput.addEventListener("focus", function () {
       setLayoutMode("input");
     });
+    if (ui.routeModeDrivingBtn) {
+      ui.routeModeDrivingBtn.addEventListener("click", function () {
+        setRouteMode("driving");
+      });
+    }
+    if (ui.routeModeTransitBtn) {
+      ui.routeModeTransitBtn.addEventListener("click", function () {
+        setRouteMode("transit");
+      });
+    }
   }
 
   function applyPublicConfig(config) {
