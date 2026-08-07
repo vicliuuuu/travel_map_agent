@@ -205,3 +205,117 @@
 - 前端收集结构同步更新：点位行新增 `type` 字段（`scenic`/`hotel`），并保持 `isHotel` 兼容标记（`app.js`）。
 
 修改时间：2026-08-03 10:28 (UTC+8)
+
+## 2026-08-03
+
+- 新增 `doc_auto/内测-v1.2-改进规划.md`：完成 v1.2 可实现性评估与改进规划草案，覆盖公网可访问、策略升级、跨城交通分段化、酒店闭环稳定性等方向。
+
+修改时间：2026-08-03 11:37 (UTC+8)
+
+## 2026-08-03
+
+- 新增愿景文档 `doc_auto/map-travel-agent-终极构想.md`：沉淀 map travel agent 的终极形态定义，包含八步流程映射、六层架构、三阶段演进路线与终态验收标准。
+
+修改时间：2026-08-03 17:54 (UTC+8)
+
+## 2026-08-04
+
+- 新增学习目录 `agent_study/`，并创建 Day1 学习文档 `agent_study/Day1-Agent架构与项目定位-详细版.md`，覆盖 Agent 核心架构、ReAct/Plan-and-Execute、travel map 项目映射、面试问答模板、实操任务与验收清单。
+
+修改时间：2026-08-04 11:16 (UTC+8)
+
+## 2026-08-06
+
+- 更新 `agent_study/Day1-Agent架构与项目定位-详细版.md`：补充 `Chatbot / RAG / Agent` 区分章节，新增输入-过程-输出对照及 travel map 对照示例，强化 Day1 认知边界内容。
+
+修改时间：2026-08-06 16:08 (UTC+8)
+
+## 2026-08-06
+
+- 新增 Day2 学习文档 `agent_study/Day2-上下文工程与上下文压缩-详细版.md`：系统化覆盖上下文五层模型、装配原则、保真压缩策略、travel map 字段级映射、面试问答模板、实操任务与验收清单。
+
+修改时间：2026-08-06 16:09 (UTC+8)
+
+## 2026-08-06
+
+- 新增 Day3 学习文档 `agent_study/Day3-工具链设计与执行策略-详细版.md`：覆盖工具链定位、schema 设计、调用生命周期、失败恢复、幂等缓存与 travel map 路由策略。
+- 新增 Day4 学习文档 `agent_study/Day4-校验与自修复闭环-详细版.md`：覆盖规则化校验器、修复动作库、状态机、防死循环与 fallback 策略。
+- 新增 Day5 学习文档 `agent_study/Day5-RAG与Memory系统设计-详细版.md`：覆盖 RAG 检索链路、Memory 设计、写入冲突治理及与工具证据融合。
+- 新增 Day6 学习文档 `agent_study/Day6-评测体系与线上治理-详细版.md`：覆盖离线评测、线上监控告警、回放降级与指标体系。
+- 新增 Day7 学习文档 `agent_study/Day7-面试整合与项目答辩-详细版.md`：覆盖项目答辩主线、38 题映射策略、案例库与终验标准。
+
+修改时间：2026-08-06 16:14 (UTC+8)
+
+## 2026-08-06
+
+- 新增速查文档 `agent_study/38题索引-速查版.md`：将 38 道面试题按原分组逐题映射到 Day1-Day7 文档章节，附一句话作答方向与 travel map 项目抓手，并给出覆盖度自评与一周目标对照结论。
+
+修改时间：2026-08-06 16:15 (UTC+8)
+
+## 2026-08-05
+
+- 取消论文稿 `C:\Users\EDY\Downloads\name.tex` 的红色修订显示：将 `\rev{}` 宏从 `\textcolor{red}{#1}` 调整为直接输出 `#1`，保留全部文本内容但不再标红。
+
+修改时间：2026-08-05 10:26 (UTC+8)
+
+## 2026-08-06
+
+- 新增 v1.3~v2.0 版本前瞻规划系列文档（每份含前瞻规划 + 提前埋点设计 + 量化评价指标，作为后续版本迭代与验收依据）：
+  - `doc_auto/内测-v1.3-前瞻规划.md`：显式状态机 + 自动修复闭环（含全项目 trace 埋点基线）。
+  - `doc_auto/内测-v1.4-前瞻规划.md`：策略引擎（多策略模板 + 后端打分器兜底）。
+  - `doc_auto/内测-v1.5-前瞻规划.md`：工具层扩展（营业时间/天气/拥堵可插拔）+ 校验层扩展（闭馆/体力/往返成本）。
+  - `doc_auto/内测-v1.6-前瞻规划.md`：记忆层（长期偏好）+ 局部重算（增量重规划）+ 多酒店。
+  - `doc_auto/内测-v1.7-前瞻规划.md`：可观测与评测体系（trace 查询 + 指标看板 + 评测集门禁 + 回放复盘）。
+  - `doc_auto/内测-v2.0-前瞻规划.md`：对话式旅行顾问 + 终态整合验收（Definition of Done）。
+- 埋点策略统一：v1.3 建立 trace 事件 schema 基线，v1.4~v1.6 在其上扩展事件字段，v1.7 消费并补全用于计算指标，v2.0 扩展对话维度。
+
+修改时间：2026-08-06 16:31 (UTC+8)
+
+## 2026-08-06
+
+- 为 v1.3~v2.0 六份前瞻规划文档补充「关键任务拆解（难点分解）」与「建议实施顺序」章节：仅拆解有难度、易踩坑的任务，每个难点给出子步骤 + 关键实现点 + 完成判据，作为版本内开发排期依据。
+  - v1.3：状态机内核落地、修复动作库（逐动作）、修复决策器与收敛控制、全链路 trace 埋点织入。
+  - v1.4：候选生成+剪枝（防组合爆炸）、打分器与权重调参、策略与修复联动。
+  - v1.5：可插拔工具接口抽象、闭馆风险时间轴校验、工具降级分级。
+  - v1.6：局部重算影响域分析、多酒店按日闭环（含换酒店日）、记忆写入冲突治理。
+  - v1.7：trace 存储检索、指标计算口径版本化、回放复盘、评测集与准入门禁。
+  - v2.0：约束抽取+主动澄清（含澄清预算）、对话-规划双状态机、结论证据绑定；「全路线收口」顺延为 §10。
+
+修改时间：2026-08-06 16:39 (UTC+8)
+
+## 2026-08-06
+
+- 实现内测 v1.2 核心三块 + 公网部署脚手架（密钥保持 keep 模式，默认策略 `fastest`）：
+  - **策略引擎**：`agent-planner.js` 新增策略模板（`fastest`/`least-transfer`/`classic`）、`computeRouteMetrics`/`scoreRoute`/`chooseBestOrder`/`buildGreedyOrder` 打分与择优、`buildStrategyExplanation` 解释；`server.js` 在 LLM 建议顺序与策略候选间择优；前端新增策略下拉与指标展示（`index.html`、`app.js`）。
+  - **跨城交通分段**：`server.js` 对跨城相邻段调用 Google Directions `transit`，`agent-planner.parseTransitLegs` 解析步行/轨交/换乘为 `legs`，输出 `transitBreakdown`；按日行程交通段填入可执行分段时长并支持折叠展开（`app.js`、`styles.css`）。
+  - **酒店闭环硬约束**：`buildDailyPlansFromPlanData` 结构化强制每日酒店闭环 + `closedLoop` 标记；新增 `verifyHotelClosure`，告警写入 `validation.lodgingWarnings` 与 `validation.hotelClosure`。
+  - **公网部署**：新增 `package.json`、`Dockerfile`、`.dockerignore`、`.env.example`、`deploy.md`；`server.js` 增加 CORS 白名单、基础限流、`GET /api/strategies` 与密钥环境变量兜底（`applyEnvKeyFallback`，非破坏性）。
+- 测试：`tests/agent-planner.test.js` 新增策略/贪心/transit 解析/酒店闭环等用例，`node --test` 全量通过（31/31）；手工 smoke 验证 `/api/strategies`、限流 429 与静态资源 200。
+- 文档与版本：更新 `VERSION`（内测 v1.2.0）、`README.md`、`doc_auto/内测-v1.2-改进规划.md`（补充实现落地记录）。
+
+修改时间：2026-08-06 16:52 (UTC+8)
+
+## 2026-08-06
+
+- 修复 v1.1 遗留的「城市归属校验过严」导致跨城场景景点被全量误排除的 bug（`server.js`）：
+  - 现象：填写英文城市名（如 `Copenhagen`/`Malmö`）时，Google 返回本地名（`København`/`Malmö`）导致城市字符串比对失败，四个景点全部进入 `excludedPlaces`，最终行程为空、路线指标显示「总通勤 0 分钟 / 跨城 0 次 / 折返 0 次」。
+  - 修复：归属校验改为**仅在国家明确冲突时排除**（且两侧均为可比较的 ASCII 名称时才判定），城市外来名/本地名差异（exonym/endonym）降级为 `validation.warnings` 软提示并保留景点。
+  - 新增 `countryConflicts`/`cityNameDiffers`/`isSameLoose`/`looksAsciiComparable`，移除过严的 `matchesDeclaredLocation`；geocode 结果查找兼容 `normalizeText` 与原始小写两种键。
+- 回归：`node --test` 全量通过（31/31）。
+
+修改时间：2026-08-06 17:20 (UTC+8)
+
+## 2026-08-06
+
+- 密钥处理落地（keep 模式 + `.env` 嵌入，保留前端可输入接口）：
+  - 新增 `.gitignore`（忽略 `.env` 等，防止密钥进 git）。
+  - `server.js` 新增 `GET /api/public-config` 与 `EXPOSE_KEYS_TO_FRONTEND` 开关：非敏感默认值（Base URL/Model）始终下发；密钥仅在开关为 `true` 时下发做自测预填。
+  - `app.js` 启动时拉取 `/api/public-config`，仅在输入框为空时预填（用户仍可手改）；正式上线设 `EXPOSE_KEYS_TO_FRONTEND=false`，前端不接收密钥。
+  - `.env.example` 增加 `EXPOSE_KEYS_TO_FRONTEND` 说明。
+- 文档：
+  - `deploy.md` 新增「免费平台推荐（2026 现状）」与「用 Render 免费部署」最短路径（Render/Koyeb/Cloud Run/Oracle Always Free 对比 + 国内访问与 Google Maps 限制提示）。
+  - `内测-v1.7-前瞻规划.md` §2.2 P1 登记「生产级限流与滥用防护（从 v1.2 顺延）」。
+  - `内测-v1.2-改进规划.md` 补充 §8.3 密钥处理、§8.4 差距归属与暂缓（含地图 transit 可视化已确认忽略）。
+- 回归：`node --test` 全量通过（31/31）；手工验证 `/api/public-config` 在开关开启时返回预填密钥。
+
+修改时间：2026-08-06 17:40 (UTC+8)

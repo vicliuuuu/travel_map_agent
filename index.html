@@ -3,13 +3,13 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>旅行规划 Agent · 内测 v1.1</title>
+  <title>旅行规划 Agent · 内测 v1.2</title>
   <link rel="stylesheet" href="./styles.css" />
 </head>
 <body>
   <header class="topbar">
-    <h1>旅行规划 Agent · 内测 v1.1</h1>
-    <p>支持多国家/多城市层级输入与可选酒店锚点；无 LLM 可标点，有 LLM 可生成按日路书。</p>
+    <h1>旅行规划 Agent · 内测 v1.2</h1>
+    <p>多国家/多城市层级输入 + 可选酒店锚点；支持策略引擎、跨城公共交通分段与酒店闭环硬约束。</p>
   </header>
 
   <main id="mainLayout" class="layout mode-input-focus">
@@ -60,6 +60,14 @@
           <input id="visitMinutesInput" type="number" min="30" max="240" value="90" />
         </label>
       </div>
+      <label>
+        规划策略
+        <select id="strategySelect">
+          <option value="fastest" selected>省时优先（总通勤最短）</option>
+          <option value="least-transfer">少换乘优先（减少跨城）</option>
+          <option value="classic">经典打卡优先（不走回头路 + 高优先级）</option>
+        </select>
+      </label>
       <button id="llmAnalyzeBtn" type="button">先用 LLM 分析景点时长</button>
       <button id="agentPlanBtn" type="button">Agent 智能规划（LLM + Google Maps）</button>
       <div id="planProgressWrap" class="plan-progress hidden">

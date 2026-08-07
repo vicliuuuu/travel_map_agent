@@ -11,6 +11,22 @@ var HOST = process.env.HOST || "127.0.0.1";
 var PORT = Number(process.env.PORT || 8080);
 var ROOT_DIR = __dirname;
 
+// v1.2 公网化配置
+var ALLOWED_ORIGINS = String(process.env.ALLOWED_ORIGINS || "")
+  .split(",")
+  .map(function (item) {
+    return item.trim();
+  })
+  .filter(function (item) {
+    return !!item;
+  });
+var RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS || 60000);
+var RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX || 30);
+var rateLimitBuckets = new Map();
+
+// 是否把后端 .env 中的密钥下发到前端输入框做预填（仅自测用；正式上线设为 false，让用户自行填写）
+var EXPOSE_KEYS_TO_FRONTEND = String(process.env.EXPOSE_KEYS_TO_FRONTEND || "false").toLowerCase() === "true";
+
 var CONTENT_TYPES = {
   ".html": "text/html; charset=utf-8",
   ".js": "application/javascript; charset=utf-8",
@@ -101,14 +117,40 @@ function parseAddressComponent(components, wantedType) {
   return found ? String(found.long_name || found.short_name || "").trim() : "";
 }
 
-function matchesDeclaredLocation(declaredCountry, declaredCity, resolvedCountry, resolvedCity) {
-  var dc = normalizeText(declaredCountry);
-  var dcity = normalizeText(declaredCity);
-  var rc = normalizeText(resolvedCountry);
-  var rcity = normalizeText(resolvedCity);
-  var countryMatch = !dc || !rc || rc.indexOf(dc) >= 0 || dc.indexOf(rc) >= 0;
-  var cityMatch = !dcity || !rcity || rcity.indexOf(dcity) >= 0 || dcity.indexOf(rcity) >= 0;
-  return countryMatch && cityMatch;
+function looksAsciiComparable(value) {
+  // 仅当两侧都是 ASCII（拉丁文）时才做字符串包含比较；含 CJK/本地字符时不做强制排除
+  return /^[\x00-\x7f]*$/.test(String(value || ""));
+}
+
+function isSameLoose(declared, resolved) {
+  var d = normalizeText(declared);
+  var r = normalizeText(resolved);
+  if (!d || !r) {
+    return true;
+  }
+  return r.indexOf(d) >= 0 || d.indexOf(r) >= 0;
+}
+
+function countryConflicts(declaredCountry, resolvedCountry) {
+  var d = normalizeText(declaredCountry);
+  var r = normalizeText(resolvedCountry);
+  if (!d || !r) {
+    return false;
+  }
+  // 声明或解析含非 ASCII（如中文国名）时无法可靠比较，放行以避免误排除
+  if (!looksAsciiComparable(declaredCountry) || !looksAsciiComparable(resolvedCountry)) {
+    return false;
+  }
+  return !isSameLoose(declaredCountry, resolvedCountry);
+}
+
+function cityNameDiffers(declaredCity, resolvedCity) {
+  var d = normalizeText(declaredCity);
+  var r = normalizeText(resolvedCity);
+  if (!d || !r) {
+    return false;
+  }
+  return !isSameLoose(declaredCity, resolvedCity);
 }
 
 function buildDefaultLodging(lodging) {
@@ -357,6 +399,126 @@ function getTravelTime(toolContext, args, mapsApiKey) {
   });
 }
 
+function fetchTransitDirections(toolContext, fromName, toName, mapsApiKey) {
+  return new Promise(function (resolve, reject) {
+    var from = toolContext.geocodeByName[String(fromName || "").trim().toLowerCase()];
+    var to = toolContext.geocodeByName[String(toName || "").trim().toLowerCase()];
+    if (!from || !to) {
+      reject(new Error("跨城 transit 查询前需先 geocode 两个景点"));
+      return;
+    }
+    var cacheKey = ["transit", from.placeName, to.placeName].join("|").toLowerCase();
+    if (toolContext.transitCache && toolContext.transitCache[cacheKey]) {
+      resolve(toolContext.transitCache[cacheKey]);
+      return;
+    }
+    var url = "https://maps.googleapis.com/maps/api/directions/json?origin=" +
+      encodeURIComponent(from.lat + "," + from.lng) +
+      "&destination=" + encodeURIComponent(to.lat + "," + to.lng) +
+      "&mode=transit&key=" + encodeURIComponent(mapsApiKey);
+
+    fetch(url)
+      .then(function (response) {
+        return response.json();
+      })
+      .then(function (data) {
+        if (data.status !== "OK" || !data.routes || !data.routes[0]) {
+          reject(new Error("transit 路线查询失败: " + data.status));
+          return;
+        }
+        if (!toolContext.transitCache) {
+          toolContext.transitCache = {};
+        }
+        toolContext.transitCache[cacheKey] = data;
+        resolve(data);
+      })
+      .catch(function (err) {
+        reject(err);
+      });
+  });
+}
+
+function buildPlaceMetaMap(places, analysisPlaces, toolContext) {
+  var priorityByName = {};
+  (Array.isArray(analysisPlaces) ? analysisPlaces : []).forEach(function (item) {
+    priorityByName[agentPlanner.normalizeName(item.name)] = String(item.priority || "medium").toLowerCase();
+  });
+  var map = {};
+  (Array.isArray(places) ? places : []).forEach(function (place) {
+    var key = agentPlanner.normalizeName(place.name);
+    var resolved = toolContext.geocodeByName[String(place.name || "").trim().toLowerCase()] || {};
+    map[key] = {
+      city: resolved.resolvedCity || place.declaredCity || "",
+      country: resolved.resolvedCountry || place.declaredCountry || "",
+      priority: priorityByName[key] || place.llmPriority || "medium",
+    };
+  });
+  return map;
+}
+
+function makeTravelLookup(toolContext) {
+  var cache = (toolContext && toolContext.travelCache) || {};
+  var keys = Object.keys(cache);
+  return function (fromName, toName) {
+    var from = String(fromName || "").toLowerCase();
+    var to = String(toName || "").toLowerCase();
+    var i;
+    for (i = 0; i < keys.length; i += 1) {
+      var parts = keys[i].split("|");
+      if (parts.length >= 2 && parts[0] === from && parts[1] === to) {
+        return Number(cache[keys[i]].durationMin) || null;
+      }
+    }
+    return null;
+  };
+}
+
+async function buildTransitBreakdowns(order, toolContext, placeMetaMap, mapsApiKey, onProgress) {
+  var names = (Array.isArray(order) ? order : []).filter(Boolean);
+  var breakdowns = [];
+  var index;
+  for (index = 1; index < names.length; index += 1) {
+    var from = names[index - 1];
+    var to = names[index];
+    var cityFrom = agentPlanner.normalizeName((placeMetaMap[agentPlanner.normalizeName(from)] || {}).city || "");
+    var cityTo = agentPlanner.normalizeName((placeMetaMap[agentPlanner.normalizeName(to)] || {}).city || "");
+    if (!cityFrom || !cityTo || cityFrom === cityTo) {
+      continue;
+    }
+    if (typeof onProgress === "function") {
+      onProgress({ stage: "transit", message: "解析跨城交通分段：" + from + " → " + to });
+    }
+    try {
+      var directions = await fetchTransitDirections(toolContext, from, to, mapsApiKey);
+      var parsed = agentPlanner.parseTransitLegs(directions);
+      if (parsed.legs.length) {
+        breakdowns.push({
+          from: from,
+          to: to,
+          mode: "transit",
+          totalDurationMin: parsed.totalDurationMin,
+          legs: parsed.legs,
+        });
+      }
+    } catch (err) {
+      // 跨城 transit 数据在部分地区不可用，保留空段由 UI 兜底提示
+    }
+  }
+  return breakdowns;
+}
+
+function makeTransitLookup(transitBreakdowns) {
+  var list = Array.isArray(transitBreakdowns) ? transitBreakdowns : [];
+  return function (fromName, toName) {
+    var from = String(fromName || "").toLowerCase();
+    var to = String(toName || "").toLowerCase();
+    var found = list.find(function (item) {
+      return String(item.from || "").toLowerCase() === from && String(item.to || "").toLowerCase() === to;
+    });
+    return found || null;
+  };
+}
+
 function buildToolSpecs() {
   return [
     {
@@ -508,26 +670,36 @@ async function runToolCallingAgent(input, onProgress) {
 function buildValidationResult(analysis, toolContext, normalizedInput) {
   var placeList = normalizedInput.places || [];
   var excludedPlaces = [];
+  var cityNotes = [];
   placeList.forEach(function (place) {
-    var key = normalizeText(place.name);
-    var resolved = toolContext.geocodeByName[key];
+    var resolved = toolContext.geocodeByName[normalizeText(place.name)] ||
+      toolContext.geocodeByName[String(place.name || "").trim().toLowerCase()];
     if (!resolved) {
       return;
     }
-    if (!matchesDeclaredLocation(place.declaredCountry, place.declaredCity, resolved.resolvedCountry, resolved.resolvedCity)) {
+    // 只有「国家」明确冲突才排除；城市外来名/本地名差异（Copenhagen vs København）不再排除
+    if (countryConflicts(place.declaredCountry, resolved.resolvedCountry)) {
       excludedPlaces.push({
         name: place.name,
         declaredCity: place.declaredCity || "",
         declaredCountry: place.declaredCountry || "",
-        reason: "地理编码结果与声明目的地不一致",
+        reason: "解析所在国家与声明国家不一致（" +
+          (resolved.resolvedCountry || "未知") + " ≠ " + (place.declaredCountry || "未填") + "）",
         resolvedAddress: resolved.formattedAddress || "",
       });
+      return;
+    }
+    if (cityNameDiffers(place.declaredCity, resolved.resolvedCity)) {
+      cityNotes.push(
+        place.name + "：声明城市「" + place.declaredCity + "」与解析城市「" +
+        (resolved.resolvedCity || "") + "」名称不同（多为本地语言/别称，已保留在行程中）"
+      );
     }
   });
   return {
     timeFeasibility: null,
     lodgingWarnings: [],
-    warnings: [],
+    warnings: cityNotes,
     excludedPlaces: excludedPlaces,
   };
 }
@@ -641,9 +813,30 @@ function filterRoadbookByOrder(roadbook, keptOrderSet) {
   return filtered;
 }
 
-async function buildAgentPlanPayload(body, reportProgress) {
+function applyEnvKeyFallback(body) {
+  // v1.2 公网化：前端仍可传 key（keep 模式），未传时回退到后端环境变量，便于公网部署
+  var merged = Object.assign({}, body);
+  if (!merged.llmBaseUrl && process.env.LLM_BASE_URL) {
+    merged.llmBaseUrl = process.env.LLM_BASE_URL;
+  }
+  if (!merged.llmApiKey && process.env.LLM_API_KEY) {
+    merged.llmApiKey = process.env.LLM_API_KEY;
+  }
+  if (!merged.llmModel && process.env.LLM_MODEL) {
+    merged.llmModel = process.env.LLM_MODEL;
+  }
+  if (!merged.mapsApiKey && process.env.MAPS_API_KEY) {
+    merged.mapsApiKey = process.env.MAPS_API_KEY;
+  }
+  return merged;
+}
+
+async function buildAgentPlanPayload(rawBody, reportProgress) {
   var pushProgress = buildProgressReporter(reportProgress);
   pushProgress({ percent: 5, stage: "prepare", message: "校验输入参数" });
+
+  var body = applyEnvKeyFallback(rawBody || {});
+  var strategyTemplate = agentPlanner.getStrategyTemplate(body.strategy);
 
   var required = ["llmBaseUrl", "llmApiKey", "llmModel", "mapsApiKey"];
   var missing = required.filter(function (key) {
@@ -724,6 +917,19 @@ async function buildAgentPlanPayload(body, reportProgress) {
       });
   }
 
+  // v1.2 策略引擎：后端打分器在 LLM 建议顺序与策略贪心候选之间择优
+  var placeMetaMap = buildPlaceMetaMap(normalized.places, analysis.places, agentRun.toolContext);
+  var travelLookup = makeTravelLookup(agentRun.toolContext);
+  var candidateOrders = [{ source: "llm", order: recommendedOrder }];
+  var greedyOrder = agentPlanner.buildGreedyOrder(recommendedOrder, placeMetaMap, travelLookup, strategyTemplate.id);
+  if (greedyOrder.length) {
+    candidateOrders.push({ source: "greedy-" + strategyTemplate.id, order: greedyOrder });
+  }
+  var chosenRoute = agentPlanner.chooseBestOrder(candidateOrders, placeMetaMap, travelLookup, strategyTemplate.id);
+  if (chosenRoute && chosenRoute.order.length) {
+    recommendedOrder = chosenRoute.order;
+  }
+
   var enrichedPlaces = agentPlanner.applyAgentInsights(
     normalized.places,
     analysis.places,
@@ -754,7 +960,25 @@ async function buildAgentPlanPayload(body, reportProgress) {
     normalized.city,
     effectiveDays
   );
-  var dailyPlans = agentPlanner.buildDailyPlansFromPlanData(planData, normalized.lodging, effectiveDays);
+
+  // v1.2 交通分段：对跨城相邻段调用 Google Directions transit 模式，输出可执行分段时长
+  pushProgress({ percent: 88, stage: "transit", message: "解析跨城公共交通分段" });
+  var transitBreakdown = await buildTransitBreakdowns(
+    effectiveOrder,
+    agentRun.toolContext,
+    placeMetaMap,
+    body.mapsApiKey,
+    function (transitProgress) {
+      pushProgress({ percent: 88, stage: "transit", message: transitProgress.message || "解析跨城公共交通" });
+    }
+  );
+  var transitLookup = makeTransitLookup(transitBreakdown);
+
+  var dailyPlans = agentPlanner.buildDailyPlansFromPlanData(planData, normalized.lodging, effectiveDays, {
+    travelLookup: travelLookup,
+    transitLookup: transitLookup,
+  });
+  var closureResult = agentPlanner.verifyHotelClosure(dailyPlans, normalized.lodging);
   var timeFeasibility = {
     feasible: estimated.naturalDays <= estimated.requestedDays,
     requestedDays: estimated.requestedDays,
@@ -779,11 +1003,23 @@ async function buildAgentPlanPayload(body, reportProgress) {
     analysis.lodgingSummary || {}
   );
 
+  var lodgingWarnings = [];
+  if (!timeFeasibility.feasible) {
+    lodgingWarnings.push("当前天数下已自动精简景点，若想全覆盖建议增加天数");
+  }
+  if (closureResult.warnings.length) {
+    lodgingWarnings = lodgingWarnings.concat(closureResult.warnings);
+  }
+
   var validation = {
     timeFeasibility: timeFeasibility,
-    lodgingWarnings: timeFeasibility.feasible ? [] : ["当前天数下已自动精简景点，若想全覆盖建议增加天数"],
-    warnings: [],
+    lodgingWarnings: lodgingWarnings,
+    warnings: localValidation.warnings || [],
     excludedPlaces: localValidation.excludedPlaces,
+    hotelClosure: {
+      closed: closureResult.closed,
+      openDays: closureResult.openDays,
+    },
   };
 
   var autoAlternativeProposals = [];
@@ -809,10 +1045,28 @@ async function buildAgentPlanPayload(body, reportProgress) {
     });
   }
 
+  var effectiveMetrics = agentPlanner.computeRouteMetrics(effectiveOrder, placeMetaMap, travelLookup);
+  var strategyExplanation = agentPlanner.buildStrategyExplanation(
+    strategyTemplate.id,
+    effectiveMetrics,
+    chosenRoute ? chosenRoute.source : "llm"
+  );
+  var combinedRouteStrategy = analysis.routeStrategy
+    ? (strategyExplanation + " " + analysis.routeStrategy)
+    : strategyExplanation;
+
   pushProgress({ percent: 95, stage: "finalize", message: "整理路书与地图输出" });
   return {
     summary: analysis.summary || "",
-    routeStrategy: analysis.routeStrategy || "",
+    routeStrategy: combinedRouteStrategy,
+    strategy: strategyTemplate.id,
+    strategyLabel: strategyTemplate.label,
+    routeMetrics: {
+      totalTravelMin: effectiveMetrics.totalTravelMin,
+      crossCityCount: effectiveMetrics.crossCityCount,
+      backtrackCount: effectiveMetrics.backtrackCount,
+    },
+    transitBreakdown: transitBreakdown,
     placeSpotlights: filterSpotlightsByOrder(analysis.placeSpotlights, effectiveOrderSet),
     roadbook: filterRoadbookByOrder(analysis.roadbook, effectiveOrderSet),
     precautions: analysis.precautions || [],
@@ -898,13 +1152,85 @@ async function handleAgentPlanStream(req, res) {
   }
 }
 
+function applyCors(req, res) {
+  var origin = req.headers.origin;
+  if (!ALLOWED_ORIGINS.length) {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+  } else if (origin && ALLOWED_ORIGINS.indexOf(origin) >= 0) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+  } else if (origin) {
+    // 来源不在白名单：拒绝跨域，但不阻断同源静态资源
+    sendJson(res, 403, { error: "来源不被允许" });
+    return false;
+  }
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  if (req.method === "OPTIONS") {
+    res.writeHead(204);
+    res.end();
+    return false;
+  }
+  return true;
+}
+
+function getClientIp(req) {
+  var forwarded = req.headers["x-forwarded-for"];
+  if (forwarded) {
+    return String(forwarded).split(",")[0].trim();
+  }
+  return (req.socket && req.socket.remoteAddress) || "unknown";
+}
+
+function enforceRateLimit(req, res) {
+  if (RATE_LIMIT_MAX <= 0) {
+    return true;
+  }
+  var ip = getClientIp(req);
+  var now = Date.now();
+  var bucket = rateLimitBuckets.get(ip) || [];
+  bucket = bucket.filter(function (timestamp) {
+    return now - timestamp < RATE_LIMIT_WINDOW_MS;
+  });
+  if (bucket.length >= RATE_LIMIT_MAX) {
+    res.setHeader("Retry-After", Math.ceil(RATE_LIMIT_WINDOW_MS / 1000));
+    sendJson(res, 429, { error: "请求过于频繁，请稍后再试" });
+    return false;
+  }
+  bucket.push(now);
+  rateLimitBuckets.set(ip, bucket);
+  return true;
+}
+
 var server = http.createServer(function (req, res) {
-  if (req.method === "POST" && req.url === "/api/agent/plan/stream") {
-    handleAgentPlanStream(req, res);
+  if (!applyCors(req, res)) {
     return;
   }
-  if (req.method === "POST" && req.url === "/api/agent/plan") {
-    handleAgentPlan(req, res);
+
+  if (req.method === "GET" && req.url.split("?")[0] === "/api/strategies") {
+    sendJson(res, 200, { strategies: agentPlanner.listStrategyTemplates() });
+    return;
+  }
+  if (req.method === "GET" && req.url.split("?")[0] === "/api/public-config") {
+    // 非敏感默认值始终下发；密钥仅在 EXPOSE_KEYS_TO_FRONTEND=true 时下发（自测便利）
+    sendJson(res, 200, {
+      llmBaseUrl: process.env.LLM_BASE_URL || "",
+      llmModel: process.env.LLM_MODEL || "",
+      exposeKeys: EXPOSE_KEYS_TO_FRONTEND,
+      llmApiKey: EXPOSE_KEYS_TO_FRONTEND ? (process.env.LLM_API_KEY || "") : "",
+      mapsApiKey: EXPOSE_KEYS_TO_FRONTEND ? (process.env.MAPS_API_KEY || "") : "",
+    });
+    return;
+  }
+  if (req.method === "POST" && (req.url === "/api/agent/plan/stream" || req.url === "/api/agent/plan")) {
+    if (!enforceRateLimit(req, res)) {
+      return;
+    }
+    if (req.url === "/api/agent/plan/stream") {
+      handleAgentPlanStream(req, res);
+    } else {
+      handleAgentPlan(req, res);
+    }
     return;
   }
   if (req.method === "GET") {

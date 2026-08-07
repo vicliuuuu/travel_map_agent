@@ -406,6 +406,22 @@ button[disabled] {
   transition: width 0.2s ease;
 }
 
+.transit-detail {
+  margin-top: 4px;
+  font-size: 12px;
+  color: #475569;
+}
+
+.transit-detail summary {
+  cursor: pointer;
+  color: #2563eb;
+}
+
+.transit-detail ul {
+  margin: 4px 0 0;
+  padding-left: 18px;
+}
+
 @media (max-width: 1200px) {
   .layout {
     grid-template-columns: 1fr;

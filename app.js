@@ -35,6 +35,7 @@
     downloadRoadbookBtn: document.getElementById("downloadRoadbookBtn"),
     daysInput: document.getElementById("daysInput"),
     visitMinutesInput: document.getElementById("visitMinutesInput"),
+    strategySelect: document.getElementById("strategySelect"),
     statusText: document.getElementById("statusText"),
     placesList: document.getElementById("placesList"),
     itineraryResult: document.getElementById("itineraryResult"),
@@ -305,6 +306,7 @@
       lodging: splitResult.lodging,
       totalDays: Number(ui.daysInput.value),
       visitMinutes: Number(ui.visitMinutesInput.value),
+      strategy: ui.strategySelect ? ui.strategySelect.value : "fastest",
     };
   }
 
@@ -691,9 +693,18 @@
       result.push(data.summary);
       result.push("");
     }
-    if (data.routeStrategy) {
-      result.push("【路线策略】");
-      result.push(data.routeStrategy);
+    if (data.routeStrategy || data.strategyLabel) {
+      result.push("【路线策略】" + (data.strategyLabel ? ("（" + data.strategyLabel + "）") : ""));
+      if (data.routeStrategy) {
+        result.push(data.routeStrategy);
+      }
+      if (data.routeMetrics && Number.isFinite(Number(data.routeMetrics.totalTravelMin))) {
+        result.push(
+          "总通勤约 " + Math.round(Number(data.routeMetrics.totalTravelMin)) + " 分钟，跨城 " +
+          (Number(data.routeMetrics.crossCityCount) || 0) + " 次，折返 " +
+          (Number(data.routeMetrics.backtrackCount) || 0) + " 次。"
+        );
+      }
       result.push("");
     }
     if (data.lodgingSummary && data.lodgingSummary.hotelName) {
@@ -727,6 +738,14 @@
             result.push("  - 游览 " + segment.placeName + (segment.visitTimeRange ? ("（" + segment.visitTimeRange + "）") : ""));
           } else {
             result.push("  - 交通 " + segment.from + " -> " + segment.to + (segment.durationRange ? ("（" + segment.durationRange + "）") : ""));
+            if (Array.isArray(segment.legs) && segment.legs.length) {
+              segment.legs.forEach(function (leg) {
+                var label = leg.type === "walk" ? "步行" : (leg.line ? (leg.type + " " + leg.line) : leg.type);
+                var route = (leg.from || leg.to) ? (" " + (leg.from || "") + " -> " + (leg.to || "")) : "";
+                var dur = Number.isFinite(Number(leg.durationMin)) ? ("（约" + Math.round(Number(leg.durationMin)) + "分钟）") : "";
+                result.push("      · " + label + route + dur);
+              });
+            }
           }
         });
       });
@@ -791,11 +810,20 @@
       );
     }
 
-    if (agentResult.routeStrategy) {
+    if (agentResult.routeStrategy || agentResult.strategyLabel) {
+      var metrics = agentResult.routeMetrics || {};
+      var metricsLine = "";
+      if (Number.isFinite(Number(metrics.totalTravelMin))) {
+        metricsLine =
+          "<p class=\"roadbook-meta\">总通勤约 " + Math.round(Number(metrics.totalTravelMin)) + " 分钟" +
+          " · 跨城 " + (Number(metrics.crossCityCount) || 0) + " 次" +
+          " · 折返 " + (Number(metrics.backtrackCount) || 0) + " 次</p>";
+      }
       sections.push(
         "<section class=\"roadbook-section\">" +
-        "<h3>路线策略</h3>" +
-        "<p>" + escapeHtml(agentResult.routeStrategy) + "</p>" +
+        "<h3>路线策略" + (agentResult.strategyLabel ? ("（" + escapeHtml(agentResult.strategyLabel) + "）") : "") + "</h3>" +
+        (agentResult.routeStrategy ? ("<p>" + escapeHtml(agentResult.routeStrategy) + "</p>") : "") +
+        metricsLine +
         "</section>"
       );
     }
@@ -889,8 +917,21 @@
               (segment.visitTimeRange ? ("（" + escapeHtml(segment.visitTimeRange) + "）") : "") +
               "</li>";
           }
+          var transitDetail = "";
+          if (Array.isArray(segment.legs) && segment.legs.length) {
+            var legsHtml = segment.legs.map(function (leg) {
+              var label = leg.type === "walk" ? "步行" : (leg.line ? (leg.type + " " + leg.line) : leg.type);
+              var route = (leg.from || leg.to) ? (escapeHtml(leg.from || "") + " → " + escapeHtml(leg.to || "")) : "";
+              return "<li>" + escapeHtml(label) +
+                (route ? ("：" + route) : "") +
+                (Number.isFinite(Number(leg.durationMin)) ? ("（约" + Math.round(Number(leg.durationMin)) + "分钟）") : "") +
+                "</li>";
+            }).join("");
+            transitDetail = "<details class=\"transit-detail\"><summary>公共交通分段</summary><ul>" + legsHtml + "</ul></details>";
+          }
           return "<li><strong>交通</strong> " + escapeHtml(segment.from) + " → " + escapeHtml(segment.to) +
             (segment.durationRange ? ("（" + escapeHtml(segment.durationRange) + "）") : "") +
+            transitDetail +
             "</li>";
         }).join("");
         return (
@@ -984,6 +1025,8 @@
       city: city,
       summary: agentResult.summary || "",
       routeStrategy: agentResult.routeStrategy || "",
+      strategyLabel: agentResult.strategyLabel || "",
+      routeMetrics: agentResult.routeMetrics || null,
       lodgingSummary: agentResult.lodgingSummary || null,
       dailyPlans: Array.isArray(agentResult.dailyPlans) ? agentResult.dailyPlans : [],
       validation: agentResult.validation || null,
@@ -1112,6 +1155,7 @@
     var city = tripInput.city;
     var totalDays = tripInput.totalDays;
     var visitMinutes = tripInput.visitMinutes;
+    var strategy = tripInput.strategy;
     var places = tripInput.places;
     var mapsApiKey = ui.apiKeyInput.value.trim();
     var llmBaseUrl = ui.llmBaseUrlInput.value.trim();
@@ -1155,6 +1199,7 @@
           city: city,
           totalDays: totalDays,
           visitMinutes: visitMinutes,
+          strategy: strategy,
           places: places,
           destinations: tripInput.destinations,
           lodging: tripInput.lodging,
@@ -1228,6 +1273,10 @@
       renderAgentRoadbook({
         summary: data.summary,
         routeStrategy: data.routeStrategy,
+        strategy: data.strategy,
+        strategyLabel: data.strategyLabel,
+        routeMetrics: data.routeMetrics,
+        transitBreakdown: data.transitBreakdown,
         placeSpotlights: data.placeSpotlights,
         roadbook: data.roadbook,
         precautions: data.precautions,
@@ -1401,6 +1450,50 @@
     });
   }
 
+  function applyPublicConfig(config) {
+    if (!config || typeof config !== "object") {
+      return;
+    }
+    // 仅在输入框为空时预填，保证用户仍可手动覆盖（正式上线时后端不下发密钥，用户自行填写）
+    if (config.llmBaseUrl && !ui.llmBaseUrlInput.value.trim()) {
+      ui.llmBaseUrlInput.value = config.llmBaseUrl;
+    }
+    if (config.llmApiKey && !ui.llmApiKeyInput.value.trim()) {
+      ui.llmApiKeyInput.value = config.llmApiKey;
+    }
+    if (config.mapsApiKey && !ui.apiKeyInput.value.trim()) {
+      ui.apiKeyInput.value = config.mapsApiKey;
+    }
+    refreshProviderAndModelByBaseUrl();
+    if (config.llmModel) {
+      var hasOption = Array.prototype.some.call(ui.llmModelSelect.options, function (opt) {
+        return opt.value === config.llmModel;
+      });
+      if (hasOption) {
+        ui.llmModelSelect.value = config.llmModel;
+      }
+    }
+    if (config.exposeKeys) {
+      updateStatus("已从后端预填密钥（自测模式）。正式上线请由用户自行填写。", false);
+    }
+  }
+
+  function loadPublicConfig() {
+    if (typeof fetch !== "function") {
+      return;
+    }
+    fetch("/api/public-config")
+      .then(function (response) {
+        return response.ok ? response.json() : null;
+      })
+      .then(function (config) {
+        applyPublicConfig(config);
+      })
+      .catch(function () {
+        // 拉取失败不影响手动填写，忽略
+      });
+  }
+
   function initDestinations() {
     addCountry("");
     refreshPlacesPreview();
@@ -1412,4 +1505,5 @@
   setLayoutMode("input");
   refreshProviderAndModelByBaseUrl();
   attachEventHandlers();
+  loadPublicConfig();
 }());
