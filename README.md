@@ -1,8 +1,8 @@
 # 旅行规划 Agent
 
-当前版本：**内测 v1.1.0**（已锁定，详见 [`doc_auto/内测-v1.1.0.md`](doc_auto/内测-v1.1.0.md)）
+当前版本：**内测 v1.2.0**（详见 [`doc_auto/内测-v1.2-改进规划.md`](doc_auto/内测-v1.2-改进规划.md)）
 
-本地可运行的旅行路线规划原型：支持多目的地层级输入、酒店锚点、地图标点与 Agent 智能路书。
+可本地运行、也可公网部署的旅行路线规划原型：支持多目的地层级输入、酒店锚点、地图标点与 Agent 智能路书；v1.2 新增策略引擎、跨城公共交通分段与酒店闭环硬约束。
 
 ## 两种使用模式
 
@@ -17,8 +17,12 @@
 - **点位类型**：每行可选景点/酒店，默认景点，酒店作为可选锚点
 - **地图标点**：无 LLM 时的核心能力，修复了多景点重叠到城市中心的问题
 - **Agent 智能路书**：LLM + Google Maps 工具（地理编码、真实车程）
+- **策略引擎（v1.2）**：省时优先 / 少换乘优先 / 经典打卡优先，后端打分器在模型建议与策略候选中择优并解释
+- **跨城公共交通分段（v1.2）**：对跨城相邻段调用 Google Directions `transit`，输出步行/轨交/换乘分段时长，替代“请以实时导航为准”
+- **酒店闭环硬约束（v1.2）**：有酒店锚点时每日首段从酒店出发、末段返回酒店，无法闭环时给出告警
 - **智能路书展示**：概述、路线策略、住宿摘要、按日路书、校验结果与替代方案
 - **LLM 供应商识别**：默认 DashScope（Qwen），兼容 OpenAI 等
+- **公网部署（v1.2）**：Docker/环境变量/CORS/限流，密钥可后端环境变量兜底（详见 [`deploy.md`](deploy.md)）
 
 ## 快速开始
 
@@ -71,9 +75,13 @@ node server.js
 node --test tests/planner.test.js tests/llm.test.js tests/agent-planner.test.js tests/location-data.test.js
 ```
 
+## 公网部署
+
+见 [`deploy.md`](deploy.md)。核心：纯 Node 内置模块（无需 `npm install`），`node server.js` 即可；Docker 一键构建，环境变量支持 CORS 白名单、限流与密钥后端兜底。
+
 ## 版本文档
 
 - 内测基线：[`doc_auto/内测-v1.0.md`](doc_auto/内测-v1.0.md)
 - 内测发布：[`doc_auto/内测-v1.1.0.md`](doc_auto/内测-v1.1.0.md)
-- 下一版本规划（草案）：[`doc_auto/内测-v1.1-改进规划.md`](doc_auto/内测-v1.1-改进规划.md)
+- v1.2 规划与实现：[`doc_auto/内测-v1.2-改进规划.md`](doc_auto/内测-v1.2-改进规划.md)
 - 变更记录：[`doc_auto/changes.md`](doc_auto/changes.md)

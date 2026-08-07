@@ -1,0 +1,14 @@
+{
+  "name": "travel-map-agent",
+  "version": "1.2.0",
+  "description": "旅行规划 Agent：地图标点 + LLM/Google Maps 工具智能路书（内测 v1.2）",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test tests/planner.test.js tests/llm.test.js tests/agent-planner.test.js tests/location-data.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}

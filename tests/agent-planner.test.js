@@ -122,4 +122,159 @@ test("buildDailyPlansFromPlanData keeps visits and hotel loop", () => {
   assert.equal(segs[0].type, "transit");
   assert.equal(segs[0].from, "Blue House");
   assert.equal(segs[segs.length - 1].to, "Blue House");
+  assert.equal(dailyPlans[0].closedLoop, true);
+});
+
+test("buildDailyPlansFromPlanData fills transit durations from lookups", () => {
+  const dailyPlans = agentPlanner.buildDailyPlansFromPlanData(
+    [
+      {
+        day: 1,
+        items: [
+          { type: "visit", title: "哥本哈根市政厅", durationMin: 90 },
+          { type: "visit", title: "马尔默竞技场", durationMin: 120 },
+        ],
+      },
+    ],
+    null,
+    1,
+    {
+      travelLookup: () => 20,
+      transitLookup: (from, to) => {
+        if (from === "哥本哈根市政厅" && to === "马尔默竞技场") {
+          return {
+            totalDurationMin: 72,
+            legs: [
+              { type: "walk", durationMin: 12 },
+              { type: "train", line: "Öresundståg", from: "København H", to: "Malmö C", durationMin: 36 },
+              { type: "walk", durationMin: 24 },
+            ],
+          };
+        }
+        return null;
+      },
+    }
+  );
+
+  const transitSeg = dailyPlans[0].segments.find(
+    (seg) => seg.type === "transit" && seg.from === "哥本哈根市政厅"
+  );
+  assert.equal(transitSeg.durationMin, 72);
+  assert.equal(transitSeg.mode, "transit");
+  assert.equal(Array.isArray(transitSeg.legs), true);
+  assert.equal(transitSeg.legs.length, 3);
+});
+
+test("verifyHotelClosure flags open days", () => {
+  const openResult = agentPlanner.verifyHotelClosure(
+    [
+      {
+        day: 1,
+        segments: [
+          { type: "visit", placeName: "A" },
+          { type: "transit", from: "A", to: "酒店" },
+        ],
+      },
+    ],
+    { mode: "single", hotel: { name: "酒店" } }
+  );
+  assert.equal(openResult.closed, false);
+  assert.deepEqual(openResult.openDays, [1]);
+
+  const closedResult = agentPlanner.verifyHotelClosure(
+    [
+      {
+        day: 1,
+        segments: [
+          { type: "transit", from: "酒店", to: "A" },
+          { type: "visit", placeName: "A" },
+          { type: "transit", from: "A", to: "酒店" },
+        ],
+      },
+    ],
+    { mode: "single", hotel: { name: "酒店" } }
+  );
+  assert.equal(closedResult.closed, true);
+});
+
+test("getStrategyTemplate falls back to fastest", () => {
+  assert.equal(agentPlanner.getStrategyTemplate("unknown").id, "fastest");
+  assert.equal(agentPlanner.getStrategyTemplate("least-transfer").id, "least-transfer");
+  assert.equal(agentPlanner.listStrategyTemplates().length, 3);
+});
+
+test("computeRouteMetrics counts cross-city and backtrack", () => {
+  const meta = {
+    a: { city: "Copenhagen" },
+    b: { city: "Malmo" },
+    c: { city: "Copenhagen" },
+  };
+  const metrics = agentPlanner.computeRouteMetrics(["A", "B", "C"], meta, () => null);
+  assert.equal(metrics.crossCityCount, 2);
+  assert.equal(metrics.backtrackCount, 1);
+  assert.equal(metrics.placeCount, 3);
+});
+
+test("chooseBestOrder prefers fewer cross-city under least-transfer", () => {
+  const meta = {
+    a: { city: "X" },
+    b: { city: "Y" },
+    c: { city: "X" },
+  };
+  const chosen = agentPlanner.chooseBestOrder(
+    [
+      { source: "llm", order: ["A", "B", "C"] },
+      { source: "greedy", order: ["A", "C", "B"] },
+    ],
+    meta,
+    () => null,
+    "least-transfer"
+  );
+  assert.deepEqual(chosen.order, ["A", "C", "B"]);
+  assert.equal(chosen.metrics.crossCityCount, 1);
+});
+
+test("buildGreedyOrder clusters same-city places for least-transfer", () => {
+  const meta = {
+    a: { city: "X" },
+    b: { city: "Y" },
+    c: { city: "X" },
+  };
+  const order = agentPlanner.buildGreedyOrder(["A", "B", "C"], meta, () => null, "least-transfer");
+  assert.equal(order[0], "A");
+  assert.equal(order[1], "C");
+  assert.equal(order[2], "B");
+});
+
+test("parseTransitLegs extracts walk and transit legs", () => {
+  const parsed = agentPlanner.parseTransitLegs({
+    routes: [
+      {
+        legs: [
+          {
+            duration: { value: 72 * 60 },
+            steps: [
+              { travel_mode: "WALKING", duration: { value: 12 * 60 } },
+              {
+                travel_mode: "TRANSIT",
+                duration: { value: 36 * 60 },
+                transit_details: {
+                  line: { short_name: "Öresundståg", vehicle: { type: "TRAIN" } },
+                  departure_stop: { name: "København H" },
+                  arrival_stop: { name: "Malmö C" },
+                },
+              },
+              { travel_mode: "WALKING", duration: { value: 24 * 60 } },
+            ],
+          },
+        ],
+      },
+    ],
+  });
+  assert.equal(parsed.totalDurationMin, 72);
+  assert.equal(parsed.legs.length, 3);
+  assert.equal(parsed.legs[1].type, "train");
+  assert.equal(parsed.legs[1].line, "Öresundståg");
+  assert.equal(parsed.legs[1].from, "København H");
+  assert.equal(parsed.legs[1].to, "Malmö C");
 });
