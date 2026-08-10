@@ -6,6 +6,16 @@ var path = require("path");
 var planner = require("./planner.js");
 var llm = require("./llm.js");
 var agentPlanner = require("./agent-planner.js");
+var tracer = require("./tracer.js");
+var verifier = require("./verifier.js");
+var repair = require("./repair.js");
+var stateMachine = require("./state-machine.js");
+
+// v1.3 收敛控制参数（可用环境变量覆盖，便于回归调参）
+var MAX_REPAIR_ROUNDS = Number(process.env.MAX_REPAIR_ROUNDS || repair.MAX_REPAIR_ROUNDS);
+var NO_IMPROVE_LIMIT = Number(process.env.NO_IMPROVE_LIMIT || repair.NO_IMPROVE_LIMIT);
+// 状态机可视化调试端点开关：内测默认开启，正式上线可设 ENABLE_DEBUG_TRACE=false
+var ENABLE_DEBUG_TRACE = String(process.env.ENABLE_DEBUG_TRACE || "true").toLowerCase() !== "false";
 
 var HOST = process.env.HOST || "127.0.0.1";
 var PORT = Number(process.env.PORT || 8080);
@@ -782,6 +792,69 @@ function estimateNaturalDaysAndSubset(orderedPlaces, requestedDays, averageTrave
   };
 }
 
+// v1.3.1 天数冲突决策树（用户期望天数 r vs 系统估算天数 d）：
+//   gap == 0      → 单一方案（r 天），无冲突；
+//   gap  > 1      → 以 LLM 为主，单一方案（d 天），不再静默删点；
+//   gap == 1      → 差 1 天视为不明显冲突，给两套完整方案让用户自选，不替用户拍板。
+function decideDayPlan(estimated, enrichedPlaces) {
+  var d = Number(estimated.naturalDays) || 1;
+  var r = Number(estimated.requestedDays) || 1;
+  var gap = Math.abs(d - r);
+  var fullPlaces = Array.isArray(enrichedPlaces) ? enrichedPlaces.slice() : [];
+  var nameOf = function (place) { return place.name; };
+  var normName = agentPlanner.normalizeName;
+
+  function variant(days, places, label) {
+    return { days: days, places: places.slice(), order: places.map(nameOf), label: label || "" };
+  }
+
+  if (gap === 0) {
+    return {
+      dayConflict: { type: "none", d: d, r: r, message: "" },
+      primary: Object.assign(variant(r, fullPlaces, ""), { dropped: [] }),
+      secondary: null,
+    };
+  }
+
+  if (gap > 1) {
+    var msg = d > r
+      ? ("按真实时长与路程，这些景点更适合安排 " + d + " 天（你填的 " + r + " 天会很赶）；已按 " + d + " 天规划，未删减景点。")
+      : ("按真实时长与路程，" + d + " 天即可从容完成（少于你填的 " + r + " 天）；已按 " + d + " 天规划。");
+    return {
+      dayConflict: { type: "llm_primary", d: d, r: r, message: msg },
+      primary: Object.assign(variant(d, fullPlaces, ""), { dropped: [] }),
+      secondary: null,
+    };
+  }
+
+  // gap === 1：两套完整方案
+  var aPlaces;
+  var aDropped;
+  if (d > r) {
+    // 需要更多天：方案A（用户 r 天）必然要删点
+    aPlaces = Array.isArray(estimated.compactPlaces) ? estimated.compactPlaces.slice() : fullPlaces.slice();
+    var keptSet = {};
+    aPlaces.forEach(function (place) { keptSet[normName(place.name)] = true; });
+    aDropped = fullPlaces
+      .filter(function (place) { return !keptSet[normName(place.name)]; })
+      .map(nameOf);
+  } else {
+    // 需要更少天：方案A（用户 r 天）保留全部景点，摊得更从容
+    aPlaces = fullPlaces.slice();
+    aDropped = [];
+  }
+  return {
+    dayConflict: {
+      type: "dual",
+      d: d,
+      r: r,
+      message: "你填 " + r + " 天、系统估算约 " + d + " 天，仅差 1 天，已给出两套方案供你选择。",
+    },
+    primary: Object.assign(variant(r, aPlaces, "方案A · 你的 " + r + " 天"), { dropped: aDropped }),
+    secondary: variant(d, fullPlaces, "方案B · 建议 " + d + " 天"),
+  };
+}
+
 function filterSpotlightsByOrder(placeSpotlights, keptOrderSet) {
   return (Array.isArray(placeSpotlights) ? placeSpotlights : []).filter(function (item) {
     return keptOrderSet.has(normalizeText(item && item.name));
@@ -831,6 +904,449 @@ function applyEnvKeyFallback(body) {
   return merged;
 }
 
+// v1.3 修复上下文：为决策器/修复动作提供当前 planData 的城市、优先级与单日景点数查询
+function buildRepairContext(ctx) {
+  return {
+    cityOf: function (name) {
+      var meta = ctx.placeMetaMap[agentPlanner.normalizeName(name)] || {};
+      return meta.city || "";
+    },
+    priorityOf: function (name) {
+      var meta = ctx.placeMetaMap[agentPlanner.normalizeName(name)] || {};
+      return meta.priority || "medium";
+    },
+    dayItemsCount: function (dayNumber) {
+      var dayPlan = (Array.isArray(ctx.planData) ? ctx.planData : []).find(function (d) {
+        return Number(d.day) === Number(dayNumber);
+      });
+      if (!dayPlan) {
+        return null;
+      }
+      return (Array.isArray(dayPlan.items) ? dayPlan.items : []).filter(function (item) {
+        return item && item.type === "visit";
+      }).length;
+    },
+  };
+}
+
+function orderFromPlanData(planData) {
+  var order = [];
+  (Array.isArray(planData) ? planData : []).forEach(function (dayPlan) {
+    (Array.isArray(dayPlan.items) ? dayPlan.items : []).forEach(function (item) {
+      if (item && item.type === "visit" && item.title) {
+        order.push(item.title);
+      }
+    });
+  });
+  return order;
+}
+
+// finalize / fallback 共用的输出组装：从最终 planData 重建顺序、指标与校验结论，保证一致性。
+function assembleResult(ctx, options) {
+  var opts = options || {};
+  var isFallback = Boolean(opts.fallback);
+  var analysis = ctx.analysis || {};
+  var normalized = ctx.normalized;
+  var strategyTemplate = ctx.strategyTemplate;
+  var estimated = ctx.estimated;
+
+  var finalOrder = orderFromPlanData(ctx.planData);
+  var finalOrderSet = new Set(finalOrder.map(function (n) { return normalizeText(n); }));
+  var finalPlaces = agentPlanner.sortByRecommendedOrder(
+    (ctx.enrichedPlaces || []).filter(function (p) { return finalOrderSet.has(normalizeText(p.name)); }),
+    finalOrder
+  );
+
+  var dailyPlans = ctx.dailyPlans && ctx.dailyPlans.length
+    ? ctx.dailyPlans
+    : agentPlanner.buildDailyPlansFromPlanData(ctx.planData, normalized.lodging, ctx.planData.length, {
+        travelLookup: ctx.travelLookup,
+        transitLookup: ctx.transitLookup,
+      });
+  var closureResult = agentPlanner.verifyHotelClosure(dailyPlans, normalized.lodging);
+
+  var findings = (ctx.verifyResult && ctx.verifyResult.findings) || [];
+  var overloadedDays = findings
+    .filter(function (f) { return f.code === verifier.CODES.TIME_OVERLOAD; })
+    .map(function (f) { return { day: f.evidence.day, estimatedMinutes: f.evidence.estimatedMinutes }; });
+
+  var dayConflict = ctx.dayConflict || { type: "none", d: estimated.naturalDays, r: estimated.requestedDays, message: "" };
+  var reasonBase = dayConflict.type !== "none" && dayConflict.message
+    ? dayConflict.message
+    : "按真实时长评估，天数安排合理。";
+  var timeFeasibility = {
+    feasible: overloadedDays.length === 0,
+    requestedDays: estimated.requestedDays,
+    suggestedDays: estimated.naturalDays,
+    reason: ctx.repairRounds > 0 ? (reasonBase + " 已执行 " + ctx.repairRounds + " 轮自动修复。") : reasonBase,
+    overloadedDays: overloadedDays,
+  };
+
+  var lodgingSummary = Object.assign(
+    {
+      hotelName: normalized.lodging && normalized.lodging.hotel ? normalized.lodging.hotel.name : "",
+      formattedAddress: normalized.lodging && normalized.lodging.hotel ? normalized.lodging.hotel.resolvedAddress || normalized.lodging.hotel.address || "" : "",
+      checkInDate: normalized.lodging && normalized.lodging.hotel ? normalized.lodging.hotel.checkInDate : "",
+      checkOutDate: normalized.lodging && normalized.lodging.hotel ? normalized.lodging.hotel.checkOutDate : "",
+      nights: null,
+      note: normalized.lodging ? "全程固定酒店，每日往返" : "",
+    },
+    analysis.lodgingSummary || {}
+  );
+
+  var lodgingWarnings = [];
+  if (!timeFeasibility.feasible) {
+    lodgingWarnings.push("当前天数下仍有单日超载，若想更从容建议增加天数");
+  }
+  if (closureResult.warnings.length) {
+    lodgingWarnings = lodgingWarnings.concat(closureResult.warnings);
+  }
+  if (isFallback) {
+    lodgingWarnings.push("已输出保底可执行方案，但仍有未完全满足项，详见校验结论。");
+  }
+
+  var excludedPlaces = ((ctx.localValidation && ctx.localValidation.excludedPlaces) || []).slice();
+  (ctx.droppedByRepair || []).forEach(function (name) {
+    excludedPlaces.push({
+      name: name,
+      declaredCity: "",
+      declaredCountry: "",
+      reason: "自动修复：为满足单日时长/可行性已删减该景点",
+      resolvedAddress: "",
+    });
+  });
+  (ctx.droppedByDayFit || []).forEach(function (name) {
+    excludedPlaces.push({
+      name: name,
+      declaredCity: "",
+      declaredCountry: "",
+      reason: "为放进你的 " + dayConflict.r + " 天（方案A）已删减；方案B（" + dayConflict.d + " 天）保留此景点",
+      resolvedAddress: "",
+    });
+  });
+
+  var validation = {
+    timeFeasibility: timeFeasibility,
+    lodgingWarnings: lodgingWarnings,
+    warnings: (ctx.localValidation && ctx.localValidation.warnings) || [],
+    excludedPlaces: excludedPlaces,
+    hotelClosure: {
+      closed: closureResult.closed,
+      openDays: closureResult.openDays,
+    },
+    findings: findings,
+    repairSummary: {
+      status: isFallback ? "fallback" : "converged",
+      rounds: ctx.repairRounds,
+      changeLogs: ctx.repairChangeLogs,
+      unresolved: isFallback ? findings.map(function (f) { return f.code; }) : [],
+      reason: isFallback ? ctx.fallbackReason : null,
+    },
+    traceId: ctx.tracer.traceId,
+  };
+
+  var effectiveMetrics = agentPlanner.computeRouteMetrics(finalOrder, ctx.placeMetaMap, ctx.travelLookup);
+  var strategyExplanation = agentPlanner.buildStrategyExplanation(
+    strategyTemplate.id,
+    effectiveMetrics,
+    ctx.chosenRoute ? ctx.chosenRoute.source : "llm"
+  );
+  var combinedRouteStrategy = analysis.routeStrategy
+    ? (strategyExplanation + " " + analysis.routeStrategy)
+    : strategyExplanation;
+
+  // v1.3.1 第二方案（仅 gap==1 时构建）：结构完整、可与主方案上下堆叠展示
+  var alternativePlan = null;
+  if (ctx.secondarySpec) {
+    var sec = ctx.secondarySpec;
+    var secPlanData = agentPlanner.buildPlanDataFromOrder(sec.order, sec.places, normalized.city, sec.days);
+    var secDaily = agentPlanner.buildDailyPlansFromPlanData(secPlanData, normalized.lodging, sec.days, {
+      travelLookup: ctx.travelLookup,
+      transitLookup: ctx.transitLookup,
+    });
+    var secMetrics = agentPlanner.computeRouteMetrics(sec.order, ctx.placeMetaMap, ctx.travelLookup);
+    var secVerify = verifier.runVerifiers({
+      planData: secPlanData,
+      dailyPlans: secDaily,
+      lodging: normalized.lodging,
+      requestedDays: sec.days,
+      cityOf: ctx.repairContext.cityOf,
+    });
+    alternativePlan = {
+      label: sec.label,
+      days: sec.days,
+      recommendedOrder: sec.order,
+      routeMetrics: {
+        totalTravelMin: secMetrics.totalTravelMin,
+        crossCityCount: secMetrics.crossCityCount,
+        backtrackCount: secMetrics.backtrackCount,
+      },
+      dailyPlans: secDaily,
+      findings: secVerify.findings,
+    };
+  }
+
+  return {
+    summary: analysis.summary || "",
+    routeStrategy: combinedRouteStrategy,
+    strategy: strategyTemplate.id,
+    strategyLabel: strategyTemplate.label,
+    routeMetrics: {
+      totalTravelMin: effectiveMetrics.totalTravelMin,
+      crossCityCount: effectiveMetrics.crossCityCount,
+      backtrackCount: effectiveMetrics.backtrackCount,
+    },
+    transitBreakdown: ctx.transitBreakdown,
+    placeSpotlights: filterSpotlightsByOrder(analysis.placeSpotlights, finalOrderSet),
+    roadbook: filterRoadbookByOrder(analysis.roadbook, finalOrderSet),
+    precautions: analysis.precautions || [],
+    recommendedOrder: finalOrder,
+    enrichedPlaces: finalPlaces,
+    planData: ctx.planData,
+    destinations: normalized.destinations,
+    lodgingSummary: lodgingSummary,
+    dailyPlans: dailyPlans,
+    validation: validation,
+    planLabel: ctx.planLabel || "",
+    dayConflict: dayConflict,
+    alternativePlan: alternativePlan,
+    alternativeProposals: [],
+    traceId: ctx.tracer.traceId,
+  };
+}
+
+// v1.3 显式状态机：collect_input（前置校验）→ build_context → plan_initial → verify → repair → finalize / fallback。
+// 各态 action 只操作单一 context（ctx），状态流转由统一调度器 runStateMachine 驱动。
+function buildPlanStates(ctx, pushProgress) {
+  var body = ctx.body;
+  var normalized = ctx.normalized;
+  var strategyTemplate = ctx.strategyTemplate;
+
+  return {
+    build_context: {
+      action: async function (context) {
+        pushProgress({ percent: 12, stage: "prepare", message: "整理目的地与住宿信息" });
+        var agentRun = await runToolCallingAgent(
+          {
+            country: normalized.country,
+            city: normalized.city,
+            totalDays: normalized.totalDays,
+            destinations: normalized.destinations,
+            lodging: normalized.lodging,
+            places: normalized.places,
+            llmBaseUrl: body.llmBaseUrl,
+            llmApiKey: body.llmApiKey,
+            llmModel: body.llmModel,
+            mapsApiKey: body.mapsApiKey,
+          },
+          function (stepProgress) {
+            var stage = stepProgress.stage || "";
+            if (stage === "pre_geocode") {
+              pushProgress({ percent: 25, stage: "geocode", message: stepProgress.message || "正在解析景点和酒店坐标" });
+            } else if (stage === "llm_thinking") {
+              pushProgress({ percent: 55, stage: "llm", message: stepProgress.message || "LLM 正在规划行程" });
+            } else if (stage === "tool_call") {
+              pushProgress({ percent: 70, stage: "tools", message: stepProgress.message || "正在调用地图工具" });
+            }
+          }
+        );
+        context.analysis = agentRun.analysis;
+        context.toolContext = agentRun.toolContext;
+        context.tracer.emit({
+          stage: "build_context",
+          eventType: "tool_call",
+          status: "ok",
+          payload: {
+            tool: "geocode+directions",
+            geocodeCount: (agentRun.toolContext.geocodeEntries || []).length,
+            travelCacheCount: Object.keys(agentRun.toolContext.travelCache || {}).length,
+          },
+        });
+        return { next: "plan_initial", status: "ok" };
+      },
+    },
+
+    plan_initial: {
+      action: async function (context) {
+        var analysis = context.analysis;
+        pushProgress({ percent: 82, stage: "validate", message: "执行本地可行性与归属校验" });
+        var localValidation = buildValidationResult(analysis, context.toolContext, normalized);
+        context.localValidation = localValidation;
+        var excludedSet = new Set(localValidation.excludedPlaces.map(function (item) {
+          return normalizeText(item.name);
+        }));
+
+        var recommendedOrder = (Array.isArray(analysis.recommendedOrder) ? analysis.recommendedOrder : []).filter(function (name) {
+          return !excludedSet.has(normalizeText(name));
+        });
+        if (!recommendedOrder.length) {
+          recommendedOrder = normalized.places
+            .map(function (item) { return item.name; })
+            .filter(function (name) { return !excludedSet.has(normalizeText(name)); });
+        }
+
+        // v1.2 策略引擎：后端打分器在 LLM 建议顺序与策略贪心候选之间择优
+        var placeMetaMap = buildPlaceMetaMap(normalized.places, analysis.places, context.toolContext);
+        var travelLookup = makeTravelLookup(context.toolContext);
+        context.placeMetaMap = placeMetaMap;
+        context.travelLookup = travelLookup;
+
+        var candidateOrders = [{ source: "llm", order: recommendedOrder }];
+        var greedyOrder = agentPlanner.buildGreedyOrder(recommendedOrder, placeMetaMap, travelLookup, strategyTemplate.id);
+        if (greedyOrder.length) {
+          candidateOrders.push({ source: "greedy-" + strategyTemplate.id, order: greedyOrder });
+        }
+        var chosenRoute = agentPlanner.chooseBestOrder(candidateOrders, placeMetaMap, travelLookup, strategyTemplate.id);
+        if (chosenRoute && chosenRoute.order.length) {
+          recommendedOrder = chosenRoute.order;
+        }
+        context.chosenRoute = chosenRoute;
+
+        var enrichedPlaces = agentPlanner.applyAgentInsights(
+          normalized.places,
+          analysis.places,
+          recommendedOrder,
+          analysis.placeSpotlights
+        ).filter(function (item) {
+          return !excludedSet.has(normalizeText(item.name));
+        });
+        context.enrichedPlaces = enrichedPlaces;
+
+        var averageTravelMin = calcAverageTravelMinutesFromRoadbook(analysis.roadbook);
+        var estimated = estimateNaturalDaysAndSubset(enrichedPlaces, normalized.totalDays, averageTravelMin);
+        context.estimated = estimated;
+
+        // v1.3.1 天数冲突决策：决定主方案（进状态机做校验/修复）与可选的第二方案
+        var dayPlan = decideDayPlan(estimated, enrichedPlaces);
+        context.dayConflict = dayPlan.dayConflict;
+        context.planLabel = dayPlan.primary.label;
+        context.secondarySpec = dayPlan.secondary;
+        context.droppedByDayFit = dayPlan.primary.dropped;
+
+        var effectiveOrder = dayPlan.primary.order;
+        context.planData = agentPlanner.buildPlanDataFromOrder(
+          dayPlan.primary.order,
+          dayPlan.primary.places,
+          normalized.city,
+          dayPlan.primary.days
+        );
+
+        // v1.2 交通分段：对跨城相邻段调用 Google Directions transit 模式，输出可执行分段时长
+        pushProgress({ percent: 88, stage: "transit", message: "解析跨城公共交通分段" });
+        context.transitBreakdown = await buildTransitBreakdowns(
+          effectiveOrder,
+          context.toolContext,
+          placeMetaMap,
+          body.mapsApiKey,
+          function (transitProgress) {
+            pushProgress({ percent: 88, stage: "transit", message: transitProgress.message || "解析跨城公共交通" });
+          }
+        );
+        context.transitLookup = makeTransitLookup(context.transitBreakdown);
+
+        return { next: "verify", status: "ok" };
+      },
+    },
+
+    verify: {
+      action: function (context) {
+        context.dailyPlans = agentPlanner.buildDailyPlansFromPlanData(
+          context.planData,
+          normalized.lodging,
+          context.planData.length,
+          { travelLookup: context.travelLookup, transitLookup: context.transitLookup }
+        );
+        var vr = verifier.runVerifiers({
+          planData: context.planData,
+          dailyPlans: context.dailyPlans,
+          lodging: normalized.lodging,
+          requestedDays: context.estimated.requestedDays,
+          cityOf: context.repairContext.cityOf,
+        });
+        context.verifyResult = vr;
+        context.scoreHistory.push(vr.score);
+        vr.findings.forEach(function (finding) {
+          context.tracer.validation(finding);
+        });
+
+        if (vr.pass) {
+          return { next: "finalize", status: "ok" };
+        }
+        var stop = repair.shouldStopRepair({
+          round: context.repairRounds,
+          maxRounds: MAX_REPAIR_ROUNDS,
+          scoreHistory: context.scoreHistory,
+          noImproveLimit: NO_IMPROVE_LIMIT,
+        });
+        if (stop.stop) {
+          context.fallbackReason = stop.reason;
+          return { next: "fallback", status: "warn" };
+        }
+        var choice = repair.chooseRepairAction(vr.findings, context.repairContext);
+        if (!choice) {
+          context.fallbackReason = "no_action";
+          return { next: "fallback", status: "warn" };
+        }
+        context.pendingRepair = choice;
+        return { next: "repair", status: "warn" };
+      },
+    },
+
+    repair: {
+      action: function (context) {
+        var beforeScore = context.verifyResult.score;
+        var applied = repair.applyRepair(
+          context.planData,
+          context.pendingRepair.action,
+          context.pendingRepair.failure,
+          context.repairContext
+        );
+        context.planData = applied.planData;
+        context.repairChangeLogs.push(applied.changeLog);
+        if (Array.isArray(applied.changeLog.removed)) {
+          applied.changeLog.removed.forEach(function (name) {
+            context.droppedByRepair.push(name);
+          });
+        }
+        context.repairRounds += 1;
+        context.tracer.repairAction({
+          action: applied.changeLog.action,
+          reason: context.pendingRepair.failure.code,
+          beforeScore: beforeScore,
+          afterScore: null,
+          diff: applied.changeLog,
+        });
+        pushProgress({
+          percent: 90,
+          stage: "repair",
+          message: "自动修复第 " + context.repairRounds + " 轮：" + (applied.changeLog.note || applied.changeLog.action),
+        });
+        return { next: "verify", status: "ok" };
+      },
+    },
+
+    finalize: {
+      action: function (context) {
+        pushProgress({ percent: 95, stage: "finalize", message: "整理路书与地图输出" });
+        context.result = assembleResult(context, { fallback: false });
+        return { status: "ok" };
+      },
+    },
+
+    fallback: {
+      action: function (context) {
+        context.tracer.fallback({
+          reason: context.fallbackReason,
+          unresolved: ((context.verifyResult && context.verifyResult.findings) || []).map(function (f) { return f.code; }),
+        });
+        pushProgress({ percent: 95, stage: "finalize", message: "输出保底可执行方案" });
+        context.result = assembleResult(context, { fallback: true });
+        return { status: "ok" };
+      },
+    },
+  };
+}
+
 async function buildAgentPlanPayload(rawBody, reportProgress) {
   var pushProgress = buildProgressReporter(reportProgress);
   pushProgress({ percent: 5, stage: "prepare", message: "校验输入参数" });
@@ -838,6 +1354,7 @@ async function buildAgentPlanPayload(rawBody, reportProgress) {
   var body = applyEnvKeyFallback(rawBody || {});
   var strategyTemplate = agentPlanner.getStrategyTemplate(body.strategy);
 
+  // collect_input（前置请求校验）：缺参/空景点仍返回 400，属 API 契约，不进入状态机兜底
   var required = ["llmBaseUrl", "llmApiKey", "llmModel", "mapsApiKey"];
   var missing = required.filter(function (key) {
     return body[key] === undefined || body[key] === null || body[key] === "";
@@ -857,228 +1374,40 @@ async function buildAgentPlanPayload(rawBody, reportProgress) {
     throw placesErr;
   }
 
-  pushProgress({ percent: 12, stage: "prepare", message: "整理目的地与住宿信息" });
-  var agentRun = await runToolCallingAgent(
-    {
-      country: normalized.country,
-      city: normalized.city,
-      totalDays: normalized.totalDays,
-      destinations: normalized.destinations,
-      lodging: normalized.lodging,
-      places: normalized.places,
-      llmBaseUrl: body.llmBaseUrl,
-      llmApiKey: body.llmApiKey,
-      llmModel: body.llmModel,
-      mapsApiKey: body.mapsApiKey,
-    },
-    function (stepProgress) {
-      var stage = stepProgress.stage || "";
-      if (stage === "pre_geocode") {
-        pushProgress({
-          percent: 25,
-          stage: "geocode",
-          message: stepProgress.message || "正在解析景点和酒店坐标",
-        });
-      } else if (stage === "llm_thinking") {
-        pushProgress({
-          percent: 55,
-          stage: "llm",
-          message: stepProgress.message || "LLM 正在规划行程",
-        });
-      } else if (stage === "tool_call") {
-        pushProgress({
-          percent: 70,
-          stage: "tools",
-          message: stepProgress.message || "正在调用地图工具",
-        });
-      }
-    }
-  );
-  var analysis = agentRun.analysis;
-
-  pushProgress({ percent: 82, stage: "validate", message: "执行本地可行性与归属校验" });
-  var localValidation = buildValidationResult(analysis, agentRun.toolContext, normalized);
-  var excludedSet = new Set(
-    localValidation.excludedPlaces.map(function (item) {
-      return normalizeText(item.name);
-    })
-  );
-
-  var recommendedOrder = (Array.isArray(analysis.recommendedOrder) ? analysis.recommendedOrder : []).filter(function (name) {
-    return !excludedSet.has(normalizeText(name));
-  });
-  if (!recommendedOrder.length) {
-    recommendedOrder = normalized.places
-      .map(function (item) {
-        return item.name;
-      })
-      .filter(function (name) {
-        return !excludedSet.has(normalizeText(name));
-      });
-  }
-
-  // v1.2 策略引擎：后端打分器在 LLM 建议顺序与策略贪心候选之间择优
-  var placeMetaMap = buildPlaceMetaMap(normalized.places, analysis.places, agentRun.toolContext);
-  var travelLookup = makeTravelLookup(agentRun.toolContext);
-  var candidateOrders = [{ source: "llm", order: recommendedOrder }];
-  var greedyOrder = agentPlanner.buildGreedyOrder(recommendedOrder, placeMetaMap, travelLookup, strategyTemplate.id);
-  if (greedyOrder.length) {
-    candidateOrders.push({ source: "greedy-" + strategyTemplate.id, order: greedyOrder });
-  }
-  var chosenRoute = agentPlanner.chooseBestOrder(candidateOrders, placeMetaMap, travelLookup, strategyTemplate.id);
-  if (chosenRoute && chosenRoute.order.length) {
-    recommendedOrder = chosenRoute.order;
-  }
-
-  var enrichedPlaces = agentPlanner.applyAgentInsights(
-    normalized.places,
-    analysis.places,
-    recommendedOrder,
-    analysis.placeSpotlights
-  ).filter(function (item) {
-    return !excludedSet.has(normalizeText(item.name));
-  });
-
-  var averageTravelMin = calcAverageTravelMinutesFromRoadbook(analysis.roadbook);
-  var estimated = estimateNaturalDaysAndSubset(enrichedPlaces, normalized.totalDays, averageTravelMin);
-  var effectivePlaces = estimated.naturalDays > estimated.requestedDays
-    ? estimated.compactPlaces
-    : enrichedPlaces.slice();
-  var effectiveOrder = effectivePlaces.map(function (item) {
-    return item.name;
-  });
-  var effectiveOrderSet = new Set(effectiveOrder.map(function (name) {
-    return normalizeText(name);
-  }));
-  var effectiveDays = estimated.naturalDays <= estimated.requestedDays
-    ? estimated.naturalDays
-    : estimated.requestedDays;
-
-  var planData = agentPlanner.buildPlanDataFromOrder(
-    effectiveOrder,
-    effectivePlaces,
-    normalized.city,
-    effectiveDays
-  );
-
-  // v1.2 交通分段：对跨城相邻段调用 Google Directions transit 模式，输出可执行分段时长
-  pushProgress({ percent: 88, stage: "transit", message: "解析跨城公共交通分段" });
-  var transitBreakdown = await buildTransitBreakdowns(
-    effectiveOrder,
-    agentRun.toolContext,
-    placeMetaMap,
-    body.mapsApiKey,
-    function (transitProgress) {
-      pushProgress({ percent: 88, stage: "transit", message: transitProgress.message || "解析跨城公共交通" });
-    }
-  );
-  var transitLookup = makeTransitLookup(transitBreakdown);
-
-  var dailyPlans = agentPlanner.buildDailyPlansFromPlanData(planData, normalized.lodging, effectiveDays, {
-    travelLookup: travelLookup,
-    transitLookup: transitLookup,
-  });
-  var closureResult = agentPlanner.verifyHotelClosure(dailyPlans, normalized.lodging);
-  var timeFeasibility = {
-    feasible: estimated.naturalDays <= estimated.requestedDays,
-    requestedDays: estimated.requestedDays,
-    suggestedDays: estimated.naturalDays,
-    reason: estimated.naturalDays > estimated.requestedDays
-      ? ("按真实时长建议 " + estimated.naturalDays + " 天；已为你压缩到 " + estimated.requestedDays + " 天并删减部分景点")
-      : (estimated.naturalDays < estimated.requestedDays
-        ? ("按真实时长可压缩为 " + estimated.naturalDays + " 天（少于用户填写的 " + estimated.requestedDays + " 天）")
-        : "按真实时长评估，用户填写天数基本合理"),
-    overloadedDays: [],
+  var requestTracer = tracer.createTracer();
+  var ctx = {
+    body: body,
+    normalized: normalized,
+    strategyTemplate: strategyTemplate,
+    tracer: requestTracer,
+    scoreHistory: [],
+    repairRounds: 0,
+    repairChangeLogs: [],
+    droppedByRepair: [],
+    planData: [],
+    dailyPlans: [],
+    verifyResult: null,
+    fallbackReason: null,
+    result: null,
   };
+  ctx.repairContext = buildRepairContext(ctx);
 
-  var lodgingSummary = Object.assign(
-    {
-      hotelName: normalized.lodging && normalized.lodging.hotel ? normalized.lodging.hotel.name : "",
-      formattedAddress: normalized.lodging && normalized.lodging.hotel ? normalized.lodging.hotel.resolvedAddress || normalized.lodging.hotel.address || "" : "",
-      checkInDate: normalized.lodging && normalized.lodging.hotel ? normalized.lodging.hotel.checkInDate : "",
-      checkOutDate: normalized.lodging && normalized.lodging.hotel ? normalized.lodging.hotel.checkOutDate : "",
-      nights: null,
-      note: normalized.lodging ? "全程固定酒店，每日往返" : "",
-    },
-    analysis.lodgingSummary || {}
-  );
-
-  var lodgingWarnings = [];
-  if (!timeFeasibility.feasible) {
-    lodgingWarnings.push("当前天数下已自动精简景点，若想全覆盖建议增加天数");
-  }
-  if (closureResult.warnings.length) {
-    lodgingWarnings = lodgingWarnings.concat(closureResult.warnings);
+  var states = buildPlanStates(ctx, pushProgress);
+  try {
+    await stateMachine.runStateMachine({
+      states: states,
+      context: ctx,
+      start: "build_context",
+      terminals: ["finalize", "fallback"],
+      tracer: requestTracer,
+      maxTransitions: 40,
+    });
+  } finally {
+    // 无论收敛/兜底/异常，都记录 trace 供 /api/debug/last-trace 复盘
+    tracer.recordTrace(requestTracer);
   }
 
-  var validation = {
-    timeFeasibility: timeFeasibility,
-    lodgingWarnings: lodgingWarnings,
-    warnings: localValidation.warnings || [],
-    excludedPlaces: localValidation.excludedPlaces,
-    hotelClosure: {
-      closed: closureResult.closed,
-      openDays: closureResult.openDays,
-    },
-  };
-
-  var autoAlternativeProposals = [];
-  if (estimated.naturalDays > estimated.requestedDays) {
-    autoAlternativeProposals.push({
-      title: "方案 A：完整游玩",
-      days: estimated.naturalDays,
-      places: enrichedPlaces.map(function (item) { return item.name; }),
-      summary: "保持全部景点，按真实时长建议拉长行程。",
-    });
-    autoAlternativeProposals.push({
-      title: "方案 B：当前天数精简版",
-      days: estimated.requestedDays,
-      places: effectiveOrder,
-      summary: "在用户天数内保留优先级更高且更顺路的景点。",
-    });
-  } else if (estimated.naturalDays < estimated.requestedDays) {
-    autoAlternativeProposals.push({
-      title: "效率方案：压缩天数",
-      days: estimated.naturalDays,
-      places: effectiveOrder,
-      summary: "按真实路程和游览时长可在更少天数完成。",
-    });
-  }
-
-  var effectiveMetrics = agentPlanner.computeRouteMetrics(effectiveOrder, placeMetaMap, travelLookup);
-  var strategyExplanation = agentPlanner.buildStrategyExplanation(
-    strategyTemplate.id,
-    effectiveMetrics,
-    chosenRoute ? chosenRoute.source : "llm"
-  );
-  var combinedRouteStrategy = analysis.routeStrategy
-    ? (strategyExplanation + " " + analysis.routeStrategy)
-    : strategyExplanation;
-
-  pushProgress({ percent: 95, stage: "finalize", message: "整理路书与地图输出" });
-  return {
-    summary: analysis.summary || "",
-    routeStrategy: combinedRouteStrategy,
-    strategy: strategyTemplate.id,
-    strategyLabel: strategyTemplate.label,
-    routeMetrics: {
-      totalTravelMin: effectiveMetrics.totalTravelMin,
-      crossCityCount: effectiveMetrics.crossCityCount,
-      backtrackCount: effectiveMetrics.backtrackCount,
-    },
-    transitBreakdown: transitBreakdown,
-    placeSpotlights: filterSpotlightsByOrder(analysis.placeSpotlights, effectiveOrderSet),
-    roadbook: filterRoadbookByOrder(analysis.roadbook, effectiveOrderSet),
-    precautions: analysis.precautions || [],
-    recommendedOrder: effectiveOrder,
-    enrichedPlaces: effectivePlaces,
-    planData: planData,
-    destinations: normalized.destinations,
-    lodgingSummary: lodgingSummary,
-    dailyPlans: dailyPlans,
-    validation: validation,
-    alternativeProposals: (Array.isArray(analysis.alternativeProposals) ? analysis.alternativeProposals : []).concat(autoAlternativeProposals),
-  };
+  return ctx.result;
 }
 
 async function handleAgentPlan(req, res) {
@@ -1211,6 +1540,20 @@ var server = http.createServer(function (req, res) {
     sendJson(res, 200, { strategies: agentPlanner.listStrategyTemplates() });
     return;
   }
+  // v1.3 状态机可视化调试端点：返回最近一次规划的完整 trace（仅内测环境开启）
+  if (req.method === "GET" && req.url.split("?")[0] === "/api/debug/last-trace") {
+    if (!ENABLE_DEBUG_TRACE) {
+      sendJson(res, 404, { error: "调试端点未启用" });
+      return;
+    }
+    var lastTrace = tracer.getLastTrace();
+    if (!lastTrace) {
+      sendJson(res, 404, { error: "暂无 trace 记录" });
+      return;
+    }
+    sendJson(res, 200, lastTrace);
+    return;
+  }
   if (req.method === "GET" && req.url.split("?")[0] === "/api/public-config") {
     // 非敏感默认值始终下发；密钥仅在 EXPOSE_KEYS_TO_FRONTEND=true 时下发（自测便利）
     sendJson(res, 200, {
@@ -1240,6 +1583,13 @@ var server = http.createServer(function (req, res) {
   sendJson(res, 405, { error: "Method Not Allowed" });
 });
 
-server.listen(PORT, HOST, function () {
-  console.log("Server running at http://" + HOST + ":" + PORT);
-});
+if (require.main === module) {
+  server.listen(PORT, HOST, function () {
+    console.log("Server running at http://" + HOST + ":" + PORT);
+  });
+}
+
+module.exports = {
+  decideDayPlan: decideDayPlan,
+  buildAgentPlanPayload: buildAgentPlanPayload,
+};

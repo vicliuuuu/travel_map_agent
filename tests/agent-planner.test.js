@@ -46,6 +46,43 @@ test("buildPlanDataFromOrder creates visit items for map rendering", () => {
   );
 });
 
+test("buildPlanDataFromOrder keeps clustered order contiguous per day (OI-1)", () => {
+  // 顺序已按城市聚类：哥本哈根两点在前，马尔默两点在后。
+  const places = [
+    { name: "小美人鱼" },
+    { name: "市政厅" },
+    { name: "马尔默竞技场" },
+    { name: "利姆港" },
+  ];
+  const order = ["小美人鱼", "市政厅", "马尔默竞技场", "利姆港"];
+  const planData = agentPlanner.buildPlanDataFromOrder(order, places, "哥本哈根", 2);
+  assert.equal(planData.length, 2);
+  // 连续分块：同城景点必须落在同一天，而非被轮询打散到两天。
+  assert.deepEqual(
+    planData[0].items.map((item) => item.title),
+    ["小美人鱼", "市政厅"]
+  );
+  assert.deepEqual(
+    planData[1].items.map((item) => item.title),
+    ["马尔默竞技场", "利姆港"]
+  );
+});
+
+test("buildPlanDataFromOrder splits unevenly with remainder front-loaded", () => {
+  const places = ["A", "B", "C", "D", "E"].map((name) => ({ name }));
+  const order = ["A", "B", "C", "D", "E"];
+  const planData = agentPlanner.buildPlanDataFromOrder(order, places, "City", 2);
+  // 5 点 / 2 天 → 前一天 3 个（余数前置），后一天 2 个，且各自连续。
+  assert.deepEqual(
+    planData[0].items.map((item) => item.title),
+    ["A", "B", "C"]
+  );
+  assert.deepEqual(
+    planData[1].items.map((item) => item.title),
+    ["D", "E"]
+  );
+});
+
 test("buildDailyPlansFromRoadbook adds hotel round-trip segments", () => {
   const dailyPlans = agentPlanner.buildDailyPlansFromRoadbook(
     [
