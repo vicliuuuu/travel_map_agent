@@ -319,3 +319,45 @@
 - 回归：`node --test` 全量通过（31/31）；手工验证 `/api/public-config` 在开关开启时返回预填密钥。
 
 修改时间：2026-08-06 17:40 (UTC+8)
+
+## 2026-08-10
+
+- 实现内测 v1.3「显式状态机 + 自动修复闭环 + 全链路 trace 埋点基线」（P0/P1/P2 全落地，对外接口契约兼容，新增字段均为增量）：
+  - **显式状态机**：新增通用引擎 `state-machine.js`（`runStateMachine`，含非法跳转/环路防护/tracer AOP 织入）；`server.js` 的 `buildAgentPlanPayload` 由顺序调用重构为 `build_context → plan_initial → verify → repair → finalize / fallback`，`verify ↔ repair` 为真实收敛环。请求级缺参/空景点仍返回 400（API 契约），规划阶段不可收敛才进 `fallback`。
+  - **结构化校验器**：新增 `verifier.js`（`runVerifiers`），输出统一 `{ code, level, message, evidence, pass }` + `score`，覆盖 `TIME_OVERLOAD`/`HOTEL_LOOP_BROKEN`/`CROSS_CITY_CONFLICT`/`TOO_MANY_EMPTY_DAYS`（error 阻断收敛、warn 不阻断）。
+  - **修复动作库 + 决策器 + 收敛控制**：新增 `repair.js`，4 类纯函数修复动作 `split_day`/`drop_lowest_priority`/`swap_neighbor`/`merge_day`（各产出 `changeLog`）；决策器 `chooseRepairAction` 按严重度路由、每轮单动作；`shouldStopRepair` 实现 `MAX_REPAIR_ROUNDS`（默认 3）+ `NO_IMPROVE_LIMIT`（默认 2）并保底回退，参数可由环境变量覆盖。
+  - **全链路 trace 埋点**：新增 `tracer.js`（schema `1.3.0`），统一 `state_enter/exit`、`tool_call`、`validation`、`repair_action`、`fallback` 事件；payload 摘要化、埋点异常记日志不静默；每请求（含异常）经 `finally` `recordTrace`，内存保留最近 20 条。
+  - **调试端点**：`server.js` 新增 `GET /api/debug/last-trace`（`ENABLE_DEBUG_TRACE` 开关，内测默认开），返回最近一次规划完整 trace。
+  - **输出增强**：`validation` 新增 `findings`（结构化校验结论）、`repairSummary`（轮次/changeLog/unresolved/reason）、`traceId`；被删景点进 `excludedPlaces` 与「补齐被自动删减的景点」替代方案；顶层新增 `traceId`。
+- 测试：新增 `tests/state-machine.test.js`、`tests/repair.test.js`、`tests/verifier.test.js`、`tests/tracer.test.js`，`package.json` test 脚本纳入；全量 `node --test` 通过（60/60）。手工 smoke：`/api/strategies` 200、`/api/debug/last-trace` 空态 404 / 有请求后返回完整 trace、缺参 400、静态资源 200；状态机异常路径 `state_enter/exit(error)` 埋点并经 `finally` 落盘正常。
+- 文档与版本：更新 `VERSION`（内测 v1.3.0）、`package.json`（1.3.0）、`README.md`、`.env.example`（新增 `MAX_REPAIR_ROUNDS`/`NO_IMPROVE_LIMIT`/`ENABLE_DEBUG_TRACE`）、`doc_auto/内测-v1.3-前瞻规划.md`（补充 §11 实现落地记录）。
+
+修改时间：2026-08-10 14:52 (UTC+8)
+
+## 2026-08-10
+
+- 智能路书体验重构（v1.3.1）：消除「行程概述 / 路线策略 / 按日行程」相互矛盾，删除噪音「替代方案」，并把天数冲突从「后端替用户拍板」改为「按规则决定或给两套方案」。
+  - **天数冲突决策树**（`server.js` 新增可测函数 `decideDayPlan`）：设 `d=系统估算天数`、`r=用户天数`、`gap=|d-r|`。`gap==0` → 单一方案；`gap>1` → 以 LLM 为主的单一方案（**不再静默删点**）；`gap==1` → 给「方案A·你的 r 天」+「方案B·建议 d 天」两套完整方案。`plan_initial` 用其决定主方案（进状态机做校验/修复），`assembleResult` 用 `secondarySpec` 构建结构完整的 `alternativePlan`（含 dailyPlans/metrics/findings）。
+  - **单一数据源**：前端 `renderAgentRoadbook` 重构为四段式——①概览头（数据驱动事实条 + 一句受约束点评 + 天数冲突提示，合并原「行程概述/路线策略/住宿摘要」）②景点速览（保留）③按日行程（合并原 LLM `roadbook` 与 `dailyPlans`，只用权威 `dailyPlans` + 车站卡片排版；`gap==1` 时第二方案上下堆叠展示）④校验与提醒（注意事项折叠）。删除 LLM 自由文本 `roadbook` 展示与旧 `alternativeProposals` 噪音区块。
+  - **输出 schema（增量）**：新增 `planLabel`、`dayConflict{type,d,r,message}`、`alternativePlan`；`alternativeProposals` 置空（旧自动/幻觉卡片移除）；被删景点在 `excludedPlaces` 标注归属方案。`summary` 前端仅取首句去矛盾。
+  - **工程改动**：`server.js` 将 `server.listen` 包进 `require.main === module` 守卫并导出 `decideDayPlan`/`buildAgentPlanPayload`，便于单测；`app.js` 新增 `renderDayCards`/`buildFactLine`/`firstSentence`/`factLineText` 等；`styles.css` 新增概览头/车站卡片/交通连接线/双方案堆叠样式；TXT 导出同步为新结构（含第二方案）。
+- 测试：新增 `tests/day-plan.test.js`（覆盖 gap==0 / gap>1 两向 / gap==1 两向共 5 例），`package.json` test 脚本纳入；全量 `node --test` 通过（65/65）。手工 smoke：`require.main` 守卫下服务正常启动，`/api/strategies` 200、静态资源 200、缺参 400 契约不变。
+
+修改时间：2026-08-10 15:40 (UTC+8)
+
+## 2026-08-10
+
+- 登记待解决问题 **OI-1**（内测反馈）：天数冲突场景下「用户天数」方案分天未按城市聚类，导致同城景点被拆到不同天、每日无谓跨城（哥本哈根+马尔默 2 天两天均跨海峡往返）。
+  - 根因：① `agent-planner.buildPlanDataFromOrder` 用 `index % days` 轮询分桶，打散聚类顺序；② 打分/校验作用在线性顺序（`computeRouteMetrics`）而非「按日分组」，看不到每日回酒店的天边界；③ `verifier` 的 `CROSS_CITY_CONFLICT` 阈值为单日 ≥2 次，单日 1 次不必要跨城不触发修复。
+  - 后续版本核对：v1.4 只在「顺序生成」层做城市聚类、未改分天与打分口径；v1.6 仅跨日边界轻校验；终极构想「全局跨城分天」未落到具体版本 → **无已规划版本明确解决**。
+  - 处置：在 `内测-v1.3-前瞻规划.md` 新增 §13「已知待解决问题」记录现象/根因/修复方向（连续分块快修 / cluster-then-assign / 打分校验改按日口径），建议归属 v1.4 或作为 v1.3.2 快修。
+
+修改时间：2026-08-10 16:10 (UTC+8)
+
+## 2026-08-10
+
+- 修复 **OI-1**（v1.3.2 快修，采纳方向 A）：`agent-planner.buildPlanDataFromOrder` 分天算法由 `index % days` 轮询分桶改为**连续分块**（按顺序切 `days` 段、余数前置），使聚类后的同城景点落在同一天，消除「天数冲突方案 A 每天跨海峡往返」的问题（哥本哈根+马尔默 2 天 → Day1 全哥本哈根、Day2 全马尔默，同日跨城降为 0）。
+  - 测试：`tests/agent-planner.test.js` 新增 `keeps clustered order contiguous per day (OI-1)` 与 `splits unevenly with remainder front-loaded`；全量 `node --test` 通过（67/67）。
+  - 文档：`内测-v1.3-前瞻规划.md` §13 OI-1 追加「修复状态」；方向 B（全局 cluster-then-assign）与方向 C（打分/校验改按日口径）仍留待 v1.4 根治（本次快修依赖传入顺序已按城市聚类）。
+
+修改时间：2026-08-10 16:18 (UTC+8)

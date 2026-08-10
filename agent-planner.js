@@ -101,9 +101,17 @@ function buildPlanDataFromOrder(recommendedOrder, places, city, totalDays) {
     buckets.push([]);
   }
 
-  orderedPlaces.forEach(function (place, index) {
-    buckets[index % days].push(place);
-  });
+  // 连续分块（contiguous chunk）而非轮询分桶：保留按城市/邻近聚类的顺序，
+  // 让相邻（常为同城）的景点落在同一天，避免每日无谓跨城往返（见 OI-1）。
+  // 余数前置：前 remainder 天各多分 1 个点。
+  var base = Math.floor(orderedPlaces.length / days);
+  var remainder = orderedPlaces.length % days;
+  var cursor = 0;
+  for (dayIndex = 0; dayIndex < days; dayIndex += 1) {
+    var take = base + (dayIndex < remainder ? 1 : 0);
+    buckets[dayIndex] = orderedPlaces.slice(cursor, cursor + take);
+    cursor += take;
+  }
 
   return buckets.map(function (dayPlaces, index) {
     return {

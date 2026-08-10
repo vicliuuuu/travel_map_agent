@@ -453,6 +453,100 @@ button[disabled] {
   padding-left: 18px;
 }
 
+/* v1.3.1 路书重构：概览头 / 车站卡片 / 双方案堆叠 */
+.roadbook-overview {
+  background: #eef4ff;
+  border-color: #bfdbfe;
+}
+
+.overview-facts {
+  font-size: 13px;
+  color: #1e3a8a;
+  font-weight: 600;
+  margin: 0 0 6px 0;
+  line-height: 1.6;
+}
+
+.overview-hotel,
+.overview-summary {
+  font-size: 13px;
+  color: #475569;
+  margin: 4px 0 0 0;
+}
+
+.overview-summary {
+  font-style: italic;
+  color: #64748b;
+}
+
+.overview-conflict {
+  margin: 8px 0 0 0;
+  padding: 8px 10px;
+  border-left: 3px solid #f59e0b;
+  background: #fffbeb;
+  border-radius: 4px;
+  font-size: 13px;
+  color: #92400e;
+}
+
+.day-block {
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  padding: 10px;
+  margin-bottom: 10px;
+  background: #ffffff;
+}
+
+.day-block h4 {
+  margin: 0 0 8px 0;
+  font-size: 14px;
+  color: #1d4ed8;
+}
+
+.station-card {
+  border-left: 3px solid #2563eb;
+  padding: 6px 10px;
+  margin: 6px 0;
+  background: #f8fbff;
+  border-radius: 4px;
+}
+
+.station-card h5 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.station-meta {
+  margin: 4px 0 0 0;
+  font-size: 12px;
+  color: #64748b;
+}
+
+.station-transit {
+  margin: 4px 0 4px 12px;
+  padding-left: 8px;
+  font-size: 12px;
+  color: #475569;
+  border-left: 2px dashed #cbd5e1;
+}
+
+.roadbook-alt {
+  background: #f5f3ff;
+  border-color: #ddd6fe;
+}
+
+.roadbook-alt h3 {
+  color: #6d28d9;
+}
+
+.roadbook-precautions summary {
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 600;
+  color: #1e293b;
+}
+
 @media (max-width: 1200px) {
   .layout {
     grid-template-columns: 1fr;

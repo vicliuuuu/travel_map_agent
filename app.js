@@ -862,74 +862,73 @@
       .replace(/'/g, "&#39;");
   }
 
+  function factLineText(days, placeCount, metrics, strategyLabel) {
+    var bits = [days + " 天", placeCount + " 个景点"];
+    var m = metrics || {};
+    if (Number.isFinite(Number(m.totalTravelMin))) {
+      bits.push("总通勤约 " + Math.round(Number(m.totalTravelMin)) + " 分钟");
+    }
+    bits.push("跨城 " + (Number(m.crossCityCount) || 0) + " 次");
+    bits.push("折返 " + (Number(m.backtrackCount) || 0) + " 次");
+    if (strategyLabel) {
+      bits.push("策略「" + strategyLabel + "」");
+    }
+    return bits.join(" · ");
+  }
+
+  function appendDailyPlansText(result, dailyPlans) {
+    (Array.isArray(dailyPlans) ? dailyPlans : []).forEach(function (dayPlan) {
+      result.push("Day " + dayPlan.day + (dayPlan.date ? (" · " + dayPlan.date) : ""));
+      (Array.isArray(dayPlan.segments) ? dayPlan.segments : []).forEach(function (segment) {
+        if (segment.type === "visit") {
+          result.push("  - 游览 " + segment.placeName + (segment.visitTimeRange ? ("（" + segment.visitTimeRange + "）") : ""));
+        } else {
+          result.push("  - 交通 " + segment.from + " -> " + segment.to + (segment.durationRange ? ("（" + segment.durationRange + "）") : ""));
+          if (Array.isArray(segment.legs) && segment.legs.length) {
+            segment.legs.forEach(function (leg) {
+              var label = leg.type === "walk" ? "步行" : (leg.line ? (leg.type + " " + leg.line) : leg.type);
+              var route = (leg.from || leg.to) ? (" " + (leg.from || "") + " -> " + (leg.to || "")) : "";
+              var dur = Number.isFinite(Number(leg.durationMin)) ? ("（约" + Math.round(Number(leg.durationMin)) + "分钟）") : "";
+              result.push("      · " + label + route + dur);
+            });
+          }
+        }
+      });
+    });
+  }
+
   function buildRoadbookText(exportData) {
     var data = exportData || {};
     var result = [];
     result.push("智能路书导出");
     result.push("生成时间: " + new Date().toLocaleString());
-    result.push("目的地: " + (data.city || "") + (data.country ? (", " + data.country) : ""));
     result.push("");
-    if (data.summary) {
-      result.push("【行程概述】");
-      result.push(data.summary);
-      result.push("");
-    }
-    if (data.routeStrategy || data.strategyLabel) {
-      result.push("【路线策略】" + (data.strategyLabel ? ("（" + data.strategyLabel + "）") : ""));
-      if (data.routeStrategy) {
-        result.push(data.routeStrategy);
-      }
-      if (data.routeMetrics && Number.isFinite(Number(data.routeMetrics.totalTravelMin))) {
-        result.push(
-          "总通勤约 " + Math.round(Number(data.routeMetrics.totalTravelMin)) + " 分钟，跨城 " +
-          (Number(data.routeMetrics.crossCityCount) || 0) + " 次，折返 " +
-          (Number(data.routeMetrics.backtrackCount) || 0) + " 次。"
-        );
-      }
-      result.push("");
-    }
-    if (data.lodgingSummary && data.lodgingSummary.hotelName) {
-      result.push("【住宿摘要】");
-      result.push("酒店: " + data.lodgingSummary.hotelName);
-      if (data.lodgingSummary.formattedAddress) {
-        result.push("地址: " + data.lodgingSummary.formattedAddress);
-      }
-      if (
-        (data.lodgingSummary.checkInDate || "").trim() ||
-        (data.lodgingSummary.checkOutDate || "").trim() ||
-        data.lodgingSummary.nights
-      ) {
-        result.push(
-          "日期: " +
-          (data.lodgingSummary.checkInDate || "") +
-          " ~ " +
-          (data.lodgingSummary.checkOutDate || "") +
-          (data.lodgingSummary.nights ? ("（" + data.lodgingSummary.nights + "晚）") : "")
-        );
-      }
-      result.push("");
-    }
+    result.push("推荐游览路书 · " + (data.city || "") + (data.country ? (", " + data.country) : ""));
     var dailyPlans = Array.isArray(data.dailyPlans) ? data.dailyPlans : [];
+    var placeCount = Array.isArray(data.recommendedOrder) ? data.recommendedOrder.length : 0;
+    result.push(factLineText(dailyPlans.length, placeCount, data.routeMetrics, data.strategyLabel));
+    if (data.lodgingSummary && data.lodgingSummary.hotelName) {
+      result.push("酒店: " + data.lodgingSummary.hotelName +
+        (data.lodgingSummary.formattedAddress ? ("（" + data.lodgingSummary.formattedAddress + "）") : ""));
+    }
+    if (data.summary) {
+      result.push(firstSentence(data.summary));
+    }
+    if (data.dayConflict && data.dayConflict.type && data.dayConflict.type !== "none" && data.dayConflict.message) {
+      result.push("⚑ " + data.dayConflict.message);
+    }
+    result.push("");
     if (dailyPlans.length) {
-      result.push("【按日行程】");
-      dailyPlans.forEach(function (dayPlan) {
-        result.push("Day " + dayPlan.day + (dayPlan.date ? (" · " + dayPlan.date) : ""));
-        (Array.isArray(dayPlan.segments) ? dayPlan.segments : []).forEach(function (segment) {
-          if (segment.type === "visit") {
-            result.push("  - 游览 " + segment.placeName + (segment.visitTimeRange ? ("（" + segment.visitTimeRange + "）") : ""));
-          } else {
-            result.push("  - 交通 " + segment.from + " -> " + segment.to + (segment.durationRange ? ("（" + segment.durationRange + "）") : ""));
-            if (Array.isArray(segment.legs) && segment.legs.length) {
-              segment.legs.forEach(function (leg) {
-                var label = leg.type === "walk" ? "步行" : (leg.line ? (leg.type + " " + leg.line) : leg.type);
-                var route = (leg.from || leg.to) ? (" " + (leg.from || "") + " -> " + (leg.to || "")) : "";
-                var dur = Number.isFinite(Number(leg.durationMin)) ? ("（约" + Math.round(Number(leg.durationMin)) + "分钟）") : "";
-                result.push("      · " + label + route + dur);
-              });
-            }
-          }
-        });
-      });
+      result.push("【按日行程" + (data.planLabel ? ("（" + data.planLabel + "）") : "") + "】");
+      appendDailyPlansText(result, dailyPlans);
+      result.push("");
+    }
+    if (data.alternativePlan && Array.isArray(data.alternativePlan.dailyPlans) && data.alternativePlan.dailyPlans.length) {
+      var alt = data.alternativePlan;
+      var altCount = Array.isArray(alt.recommendedOrder) ? alt.recommendedOrder.length : 0;
+      result.push("【" + (alt.label || "备选方案") + "】");
+      result.push(factLineText(alt.days, altCount, alt.routeMetrics, data.strategyLabel));
+      appendDailyPlansText(result, alt.dailyPlans);
       result.push("");
     }
     if (data.validation && data.validation.timeFeasibility) {
@@ -974,6 +973,74 @@
     updateStatus("已导出 TXT 路书。", false);
   }
 
+  function firstSentence(text) {
+    var s = String(text || "").trim();
+    if (!s) {
+      return "";
+    }
+    var m = s.split(/(?<=[。！？.!?])\s*/)[0];
+    var out = m && m.length ? m : s;
+    if (out.length > 60) {
+      out = out.slice(0, 60) + "…";
+    }
+    return out;
+  }
+
+  function buildFactLine(days, placeCount, metrics, strategyLabel) {
+    var bits = [];
+    bits.push(days + " 天");
+    bits.push(placeCount + " 个景点");
+    var m = metrics || {};
+    if (Number.isFinite(Number(m.totalTravelMin))) {
+      bits.push("总通勤约 " + Math.round(Number(m.totalTravelMin)) + " 分钟");
+    }
+    bits.push("跨城 " + (Number(m.crossCityCount) || 0) + " 次");
+    bits.push("折返 " + (Number(m.backtrackCount) || 0) + " 次");
+    if (strategyLabel) {
+      bits.push("策略「" + strategyLabel + "」");
+    }
+    return bits.join(" · ");
+  }
+
+  function renderTransitConnector(segment) {
+    var transitDetail = "";
+    if (Array.isArray(segment.legs) && segment.legs.length) {
+      var legsHtml = segment.legs.map(function (leg) {
+        var label = leg.type === "walk" ? "步行" : (leg.line ? (leg.type + " " + leg.line) : leg.type);
+        var route = (leg.from || leg.to) ? (escapeHtml(leg.from || "") + " → " + escapeHtml(leg.to || "")) : "";
+        return "<li>" + escapeHtml(label) +
+          (route ? ("：" + route) : "") +
+          (Number.isFinite(Number(leg.durationMin)) ? ("（约" + Math.round(Number(leg.durationMin)) + "分钟）") : "") +
+          "</li>";
+      }).join("");
+      transitDetail = "<details class=\"transit-detail\"><summary>公共交通分段</summary><ul>" + legsHtml + "</ul></details>";
+    }
+    return "<div class=\"station-transit\">↳ " + escapeHtml(segment.from) + " 前往 " + escapeHtml(segment.to) +
+      (segment.durationRange ? ("（" + escapeHtml(segment.durationRange) + "）") : "") +
+      transitDetail +
+      "</div>";
+  }
+
+  function renderDayCards(dailyPlans) {
+    return (Array.isArray(dailyPlans) ? dailyPlans : []).map(function (dayPlan) {
+      var stationNo = 0;
+      var body = (Array.isArray(dayPlan.segments) ? dayPlan.segments : []).map(function (segment) {
+        if (segment.type === "visit") {
+          stationNo += 1;
+          return "<article class=\"station-card\">" +
+            "<h5>第 " + stationNo + " 站 · " + escapeHtml(segment.placeName) + "</h5>" +
+            (segment.visitTimeRange ? ("<p class=\"station-meta\">游玩：" + escapeHtml(segment.visitTimeRange) + "</p>") : "") +
+            "</article>";
+        }
+        return renderTransitConnector(segment);
+      }).join("");
+      return "<div class=\"day-block\">" +
+        "<h4>Day " + dayPlan.day + (dayPlan.date ? (" · " + escapeHtml(dayPlan.date)) : "") + "</h4>" +
+        body +
+        "</div>";
+    }).join("");
+  }
+
   function renderAgentRoadbook(agentResult, country, city) {
     if (!agentResult) {
       ui.itineraryResult.innerHTML = "<p>无路书内容，请检查 LLM 配置后重试。</p>";
@@ -982,57 +1049,31 @@
 
     var sections = [];
 
-    if (agentResult.summary) {
-      sections.push(
-        "<section class=\"roadbook-section\">" +
-        "<h3>行程概述</h3>" +
-        "<p>" + escapeHtml(agentResult.summary) + "</p>" +
-        "</section>"
-      );
-    }
-
-    if (agentResult.routeStrategy || agentResult.strategyLabel) {
-      var metrics = agentResult.routeMetrics || {};
-      var metricsLine = "";
-      if (Number.isFinite(Number(metrics.totalTravelMin))) {
-        metricsLine =
-          "<p class=\"roadbook-meta\">总通勤约 " + Math.round(Number(metrics.totalTravelMin)) + " 分钟" +
-          " · 跨城 " + (Number(metrics.crossCityCount) || 0) + " 次" +
-          " · 折返 " + (Number(metrics.backtrackCount) || 0) + " 次</p>";
-      }
-      sections.push(
-        "<section class=\"roadbook-section\">" +
-        "<h3>路线策略" + (agentResult.strategyLabel ? ("（" + escapeHtml(agentResult.strategyLabel) + "）") : "") + "</h3>" +
-        (agentResult.routeStrategy ? ("<p>" + escapeHtml(agentResult.routeStrategy) + "</p>") : "") +
-        metricsLine +
-        "</section>"
-      );
-    }
-
-    if (agentResult.lodgingSummary && agentResult.lodgingSummary.hotelName) {
-      var hasDateInfo = Boolean(
-        (agentResult.lodgingSummary.checkInDate || "").trim() ||
-        (agentResult.lodgingSummary.checkOutDate || "").trim() ||
-        agentResult.lodgingSummary.nights
-      );
-      sections.push(
-        "<section class=\"roadbook-section\">" +
-        "<h3>住宿摘要</h3>" +
-        "<p><strong>酒店：</strong>" + escapeHtml(agentResult.lodgingSummary.hotelName) + "</p>" +
-        (agentResult.lodgingSummary.formattedAddress
-          ? ("<p><strong>地址：</strong>" + escapeHtml(agentResult.lodgingSummary.formattedAddress) + "</p>")
-          : "") +
-        (hasDateInfo
-          ? ("<p><strong>日期：</strong>" +
-            escapeHtml(agentResult.lodgingSummary.checkInDate || "") +
-            " ~ " +
-            escapeHtml(agentResult.lodgingSummary.checkOutDate || "") +
-            (agentResult.lodgingSummary.nights ? ("（" + agentResult.lodgingSummary.nights + " 晚）") : "") +
-            "</p>")
-          : "") +
-        "</section>"
-      );
-    }
+    // 概览头：数据驱动的事实条 + 一句受约束点评 + 天数冲突提示（路线策略/住宿摘要已并入此处）
+    var overviewMetrics = agentResult.routeMetrics || {};
+    var overviewDays = (Array.isArray(agentResult.dailyPlans) ? agentResult.dailyPlans : []).length;
+    var overviewPlaceCount = (Array.isArray(agentResult.recommendedOrder) ? agentResult.recommendedOrder : []).length;
+    var lodging = agentResult.lodgingSummary || {};
+    var hotelLine = lodging.hotelName
+      ? ("<p class=\"overview-hotel\"><strong>酒店：</strong>" + escapeHtml(lodging.hotelName) +
+          (lodging.formattedAddress ? ("（" + escapeHtml(lodging.formattedAddress) + "）") : "") + "</p>")
+      : "";
+    var summaryLine = agentResult.summary
+      ? ("<p class=\"overview-summary\">" + escapeHtml(firstSentence(agentResult.summary)) + "</p>")
+      : "";
+    var conflict = agentResult.dayConflict || {};
+    var conflictLine = (conflict.type && conflict.type !== "none" && conflict.message)
+      ? ("<p class=\"overview-conflict\">⚑ " + escapeHtml(conflict.message) + "</p>")
+      : "";
+    sections.push(
+      "<section class=\"roadbook-section roadbook-overview\">" +
+      "<h3>推荐游览路书 · " + escapeHtml(city) + ", " + escapeHtml(country) + "</h3>" +
+      "<p class=\"overview-facts\">" + escapeHtml(buildFactLine(overviewDays, overviewPlaceCount, overviewMetrics, agentResult.strategyLabel)) + "</p>" +
+      hotelLine +
+      summaryLine +
+      conflictLine +
+      "</section>"
+    );
 
     var spotlights = Array.isArray(agentResult.placeSpotlights) ? agentResult.placeSpotlights : [];
     if (spotlights.length) {
@@ -1058,74 +1099,27 @@
       );
     }
 
-    var roadbook = Array.isArray(agentResult.roadbook) ? agentResult.roadbook : [];
-    if (roadbook.length) {
-      var stepsHtml = roadbook.map(function (step) {
-        var travel = step.travelToNext;
-        var travelHtml = "";
-        if (travel && travel.destination) {
-          travelHtml =
-            "<div class=\"roadbook-transit\">" +
-            "<strong>前往下一站 " + escapeHtml(travel.destination) + "</strong>" +
-            (travel.durationRange ? ("<p>路程：" + escapeHtml(travel.durationRange) + "</p>") : "") +
-            (travel.distanceText ? ("<p>距离：" + escapeHtml(travel.distanceText) + "</p>") : "") +
-            (travel.note ? ("<p class=\"roadbook-note\">" + escapeHtml(travel.note) + "</p>") : "") +
-            "</div>";
-        }
-        return (
-          "<article class=\"roadbook-step\">" +
-          "<h4>第 " + step.step + " 站 · " + escapeHtml(step.placeName) + "</h4>" +
-          (step.visitTimeRange ? ("<p><strong>游玩时间：</strong>" + escapeHtml(step.visitTimeRange) + "</p>") : "") +
-          (step.visitTips ? ("<p class=\"roadbook-note\">" + escapeHtml(step.visitTips) + "</p>") : "") +
-          travelHtml +
-          "</article>"
-        );
-      }).join("");
+    // ⑤原「推荐游览路书」(LLM 自由步骤) 与 ⑥「按日行程」合并：只用权威 dailyPlans，套用车站卡片排版
+    var dailyPlans = Array.isArray(agentResult.dailyPlans) ? agentResult.dailyPlans : [];
+    if (dailyPlans.length) {
+      var primaryLabel = agentResult.planLabel ? (" · " + escapeHtml(agentResult.planLabel)) : "";
       sections.push(
         "<section class=\"roadbook-section\">" +
-        "<h3>推荐游览路书 · " + escapeHtml(city) + ", " + escapeHtml(country) + "</h3>" +
-        stepsHtml +
+        "<h3>按日行程（酒店闭环）" + primaryLabel + "</h3>" +
+        renderDayCards(dailyPlans) +
         "</section>"
       );
     }
 
-    var dailyPlans = Array.isArray(agentResult.dailyPlans) ? agentResult.dailyPlans : [];
-    if (dailyPlans.length) {
-      var dailyHtml = dailyPlans.map(function (dayPlan) {
-        var segmentHtml = (Array.isArray(dayPlan.segments) ? dayPlan.segments : []).map(function (segment) {
-          if (segment.type === "visit") {
-            return "<li><strong>游览</strong> " + escapeHtml(segment.placeName) +
-              (segment.visitTimeRange ? ("（" + escapeHtml(segment.visitTimeRange) + "）") : "") +
-              "</li>";
-          }
-          var transitDetail = "";
-          if (Array.isArray(segment.legs) && segment.legs.length) {
-            var legsHtml = segment.legs.map(function (leg) {
-              var label = leg.type === "walk" ? "步行" : (leg.line ? (leg.type + " " + leg.line) : leg.type);
-              var route = (leg.from || leg.to) ? (escapeHtml(leg.from || "") + " → " + escapeHtml(leg.to || "")) : "";
-              return "<li>" + escapeHtml(label) +
-                (route ? ("：" + route) : "") +
-                (Number.isFinite(Number(leg.durationMin)) ? ("（约" + Math.round(Number(leg.durationMin)) + "分钟）") : "") +
-                "</li>";
-            }).join("");
-            transitDetail = "<details class=\"transit-detail\"><summary>公共交通分段</summary><ul>" + legsHtml + "</ul></details>";
-          }
-          return "<li><strong>交通</strong> " + escapeHtml(segment.from) + " → " + escapeHtml(segment.to) +
-            (segment.durationRange ? ("（" + escapeHtml(segment.durationRange) + "）") : "") +
-            transitDetail +
-            "</li>";
-        }).join("");
-        return (
-          "<article class=\"roadbook-step\">" +
-          "<h4>Day " + dayPlan.day + (dayPlan.date ? (" · " + escapeHtml(dayPlan.date)) : "") + "</h4>" +
-          "<ul>" + segmentHtml + "</ul>" +
-          "</article>"
-        );
-      }).join("");
+    // gap==1 的第二方案：上下堆叠、同时展开
+    var altPlan = agentResult.alternativePlan;
+    if (altPlan && Array.isArray(altPlan.dailyPlans) && altPlan.dailyPlans.length) {
+      var altPlaceCount = (Array.isArray(altPlan.recommendedOrder) ? altPlan.recommendedOrder : []).length;
       sections.push(
-        "<section class=\"roadbook-section\">" +
-        "<h3>按日行程（酒店闭环）</h3>" +
-        dailyHtml +
+        "<section class=\"roadbook-section roadbook-alt\">" +
+        "<h3>" + escapeHtml(altPlan.label || "备选方案") + "</h3>" +
+        "<p class=\"overview-facts\">" + escapeHtml(buildFactLine(altPlan.days, altPlaceCount, altPlan.routeMetrics, agentResult.strategyLabel)) + "</p>" +
+        renderDayCards(altPlan.dailyPlans) +
         "</section>"
       );
     }
@@ -1162,33 +1156,19 @@
       );
     }
 
-    if (Array.isArray(agentResult.alternativeProposals) && agentResult.alternativeProposals.length) {
-      var proposals = agentResult.alternativeProposals.map(function (item) {
-        return (
-          "<article class=\"roadbook-step\">" +
-          "<h4>" + escapeHtml(item.title || "替代方案") + "</h4>" +
-          (item.days ? ("<p>建议天数：" + escapeHtml(String(item.days)) + "</p>") : "") +
-          (Array.isArray(item.places) ? ("<p>景点：" + escapeHtml(item.places.join("、")) + "</p>") : "") +
-          (item.summary ? ("<p>" + escapeHtml(item.summary) + "</p>") : "") +
-          "</article>"
-        );
-      }).join("");
-      sections.push(
-        "<section class=\"roadbook-section\">" +
-        "<h3>替代方案</h3>" + proposals + "</section>"
-      );
-    }
+    // 旧「替代方案」噪音区块已移除；唯一的多方案是 gap==1 的第二方案（上方堆叠展示）
 
     var precautions = Array.isArray(agentResult.precautions) ? agentResult.precautions : [];
     if (precautions.length) {
       sections.push(
         "<section class=\"roadbook-section roadbook-precautions\">" +
-        "<h3>注意事项</h3>" +
+        "<details><summary>注意事项（" + precautions.length + "）</summary>" +
         "<ul>" +
         precautions.map(function (item) {
           return "<li>" + escapeHtml(item) + "</li>";
         }).join("") +
         "</ul>" +
+        "</details>" +
         "</section>"
       );
     }
@@ -1205,13 +1185,16 @@
       country: country,
       city: city,
       summary: agentResult.summary || "",
-      routeStrategy: agentResult.routeStrategy || "",
       strategyLabel: agentResult.strategyLabel || "",
       routeMetrics: agentResult.routeMetrics || null,
+      recommendedOrder: Array.isArray(agentResult.recommendedOrder) ? agentResult.recommendedOrder : [],
       lodgingSummary: agentResult.lodgingSummary || null,
       dailyPlans: Array.isArray(agentResult.dailyPlans) ? agentResult.dailyPlans : [],
       validation: agentResult.validation || null,
       precautions: Array.isArray(agentResult.precautions) ? agentResult.precautions : [],
+      planLabel: agentResult.planLabel || "",
+      dayConflict: agentResult.dayConflict || null,
+      alternativePlan: agentResult.alternativePlan || null,
     };
     ui.downloadRoadbookBtn.classList.remove("hidden");
   }
@@ -1451,21 +1434,7 @@
       var planData = Array.isArray(data.planData) ? data.planData : [];
       state.places = Array.isArray(data.enrichedPlaces) ? data.enrichedPlaces : places;
       renderPlacesList();
-      renderAgentRoadbook({
-        summary: data.summary,
-        routeStrategy: data.routeStrategy,
-        strategy: data.strategy,
-        strategyLabel: data.strategyLabel,
-        routeMetrics: data.routeMetrics,
-        transitBreakdown: data.transitBreakdown,
-        placeSpotlights: data.placeSpotlights,
-        roadbook: data.roadbook,
-        precautions: data.precautions,
-        lodgingSummary: data.lodgingSummary,
-        dailyPlans: data.dailyPlans,
-        validation: data.validation,
-        alternativeProposals: data.alternativeProposals,
-      }, country, city);
+      renderAgentRoadbook(data, country, city);
       if (state.mapReady) {
         await renderRouteOnMap(planData, country, city, data.lodgingSummary || null);
         updateStatus("智能路书已生成，地图路线已按推荐顺序展示。", false);
