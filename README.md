@@ -1,8 +1,8 @@
 # 旅行规划 Agent
 
-当前版本：**内测 v1.3.0**（详见 [`doc_auto/内测-v1.3-前瞻规划.md`](doc_auto/内测-v1.3-前瞻规划.md)）
+当前版本：**内测 v1.4.0**（详见 [`doc_auto/内测-v1.4-前瞻规划.md`](doc_auto/内测-v1.4-前瞻规划.md)）
 
-可本地运行、也可公网部署的旅行路线规划原型：支持多目的地层级输入、酒店锚点、地图标点与 Agent 智能路书；v1.2 引入策略引擎、跨城公共交通分段与酒店闭环硬约束，v1.3 把隐式流程升级为「显式状态机 + 自动修复闭环」，并建立全链路 trace 埋点基线。
+可本地运行、也可公网部署的旅行路线规划原型：支持多目的地层级输入、酒店锚点、地图标点与 Agent 智能路书；v1.2 引入策略引擎、跨城公共交通分段与酒店闭环硬约束，v1.3 把隐式流程升级为「显式状态机 + 自动修复闭环」并建立全链路 trace 埋点基线，v1.4 升级为「策略引擎（多策略打分 + 候选剪枝 + 打分兜底）」并根治 OI-1 跨城分天。
 
 ## 两种使用模式
 
@@ -23,6 +23,10 @@
 - **显式状态机（v1.3）**：`build_context → plan_initial → verify → repair → finalize / fallback` 由统一调度器驱动，含非法跳转与环路防护
 - **自动修复闭环（v1.3）**：结构化校验器（超载/跨城冲突/闭环断裂/空天）触发修复动作库（拆天/删点/换序/并天），带轮次上限、无改善阈值与保底回退
 - **全链路 trace 埋点（v1.3）**：state_enter/exit、tool_call、validation、repair_action、fallback 统一 schema 落地，`GET /api/debug/last-trace` 可复盘（内测）
+- **策略引擎升级（v1.4）**：统一打分器（度量归一化 + 得分构成）+ 多路候选生成与剪枝（上限 K，防组合爆炸）+ 打分器主导排序；结构化 `strategyExplanation`（含次优对比与 scoreGap）与 A/B 策略对比 `strategyComparison`（用户策略 vs 次优策略）
+- **OI-1 分天根治（v1.4）**：cluster-then-assign 全局按城市聚类分天（任意策略下同城同日、消除无谓跨城）+ 按日分组口径跨城统计（`routeMetrics.crossCityByDay`）
+- **交通模式偏好（v1.4）**：请求体 `transportPreference: driving|transit|walking` 以权重乘子接入打分（driving 为默认）
+- **埋点扩展（v1.4）**：新增 strategy_select / scoring / alternative_compare 事件，trace schema 升至 1.4.0
 - **智能路书展示**：概述、路线策略、住宿摘要、按日路书、校验结果与替代方案
 - **LLM 供应商识别**：默认 DashScope（Qwen），兼容 OpenAI 等
 - **公网部署（v1.2）**：Docker/环境变量/CORS/限流，密钥可后端环境变量兜底（详见 [`deploy.md`](deploy.md)）
@@ -75,8 +79,10 @@ node server.js
 ## 测试
 
 ```bash
-node --test tests/planner.test.js tests/llm.test.js tests/agent-planner.test.js tests/location-data.test.js tests/verifier.test.js tests/repair.test.js tests/state-machine.test.js tests/tracer.test.js
+node --test tests/planner.test.js tests/llm.test.js tests/agent-planner.test.js tests/location-data.test.js tests/verifier.test.js tests/repair.test.js tests/state-machine.test.js tests/tracer.test.js tests/day-plan.test.js tests/scoring.test.js
 ```
+
+或直接 `npm test`（已包含全部测试文件）。
 
 ## 公网部署
 
@@ -88,4 +94,5 @@ node --test tests/planner.test.js tests/llm.test.js tests/agent-planner.test.js 
 - 内测发布：[`doc_auto/内测-v1.1.0.md`](doc_auto/内测-v1.1.0.md)
 - v1.2 规划与实现：[`doc_auto/内测-v1.2-改进规划.md`](doc_auto/内测-v1.2-改进规划.md)
 - v1.3 规划与实现：[`doc_auto/内测-v1.3-前瞻规划.md`](doc_auto/内测-v1.3-前瞻规划.md)
+- v1.4 规划与实现：[`doc_auto/内测-v1.4-前瞻规划.md`](doc_auto/内测-v1.4-前瞻规划.md)
 - 变更记录：[`doc_auto/changes.md`](doc_auto/changes.md)

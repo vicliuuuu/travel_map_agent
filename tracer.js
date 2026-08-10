@@ -3,10 +3,11 @@
 // v1.3 全链路 trace 埋点基线。
 // 本 schema 是全项目埋点基线，后续版本（v1.4~v1.7）在其上扩展字段，v1.7 可观测体系直接消费。
 // 约束：埋点不得阻塞主流程；埋点异常必须记录日志（遵循「无静默失败」），不得静默吞掉。
+// v1.4：新增 strategy_select / scoring / alternative_compare 三类事件（复用统一 emit 通道），schema 升至 1.4.0。
 
 var crypto = require("crypto");
 
-var SCHEMA_VERSION = "1.3.0";
+var SCHEMA_VERSION = "1.4.0";
 
 function newId() {
   if (crypto && typeof crypto.randomUUID === "function") {
@@ -133,6 +134,7 @@ function createTracer(options) {
         reason: i.reason,
         beforeScore: i.beforeScore,
         afterScore: i.afterScore,
+        strategy: i.strategy,
         diff: i.diff,
       },
     });

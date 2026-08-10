@@ -361,3 +361,19 @@
   - 文档：`内测-v1.3-前瞻规划.md` §13 OI-1 追加「修复状态」；方向 B（全局 cluster-then-assign）与方向 C（打分/校验改按日口径）仍留待 v1.4 根治（本次快修依赖传入顺序已按城市聚类）。
 
 修改时间：2026-08-10 16:18 (UTC+8)
+
+## 2026-08-10（内测 v1.4：策略引擎 + 打分兜底 + OI-1 根治）
+
+在 v1.3 状态机/修复闭环基础上落地 v1.4「策略引擎（多策略 + 后端打分器兜底）」P0+P1+P2，并根治 OI-1。对外接口（`POST /api/agent/plan`、`/api/agent/plan/stream`）保持兼容，新增字段均为**增量**；默认策略 + 默认交通偏好（driving）下输出与 v1.3 等价。
+
+- **统一评分器**（新增 `scoring.js`，纯函数无外部依赖）：度量归一化到 `[0,1]`（travel/crossCity/backtrack 越大越差、priority 命中率越大越好），`scoreMetrics` 输出 `{ score, breakdown, normalized }`；`agent-planner.scoreRoute` 重构为委托调用（避免双份评分公式漂移），新增 `scoreRouteDetailed`。
+- **候选生成 + 剪枝**（`agent-planner.generateCandidateOrders`）：多路候选（LLM 基准 + 三策略贪心 + 优先级排序 + 调用方注入）→ 去重（顺序等价只留一个）→ 上限 `K`（默认 20，`CANDIDATE_LIMIT` 可覆盖）截断，防组合爆炸；`chooseBestOrder` 输出 `breakdown`/`secondBest`/`candidates` 全排名。
+- **OI-1 根治**（方向 B + C）：新增 `clusterOrderByCity`（先按城市稳定聚类，作为唯一顺序源在 `plan_initial` 一次性传导到 enrichedPlaces/分天/planData/roadbook），使**任意策略**（含 fastest）下同城景点同日、消除无谓跨城；新增 `computeDailyMetrics`（按日分组口径的跨城统计，输出到 `routeMetrics.crossCityByDay`/`crossCityWithinDay`，仅上报不改 verifier 阈值——按用户决定 `CROSS_CITY_CONFLICT_THRESHOLD` 维持为 2）。
+- **策略解释增强**（`buildStrategyExplanationDetail`）：输出结构化 `strategyExplanation{ strategy, chosenBreakdown, secondBest, scoreGap, reason }`，含「为什么优于次优方案」。
+- **策略×修复联动**（`repair.rescorePlanWithStrategy` + 修复上下文 `scoreOrder`）：修复后用当前策略权重重打分，写入 `repair_action` trace 的 `afterScore`，保证修复不破坏策略取向。
+- **A/B 多方案对比**（`compareStrategies`）：主方案=用户所选策略，对比方案=同候选集上「与主方案差异最大」的其他策略，输出增量字段 `strategyComparison{ primary, runnerUp{ tradeoff } }`（独立于 v1.3.1 天数 `alternativePlan`，不冲突）；前端概览下新增「策略对比」块。
+- **P2 交通模式偏好**（`applyTransportPreference`）：请求体新增 `transportPreference: driving|transit|walking`，以权重乘子作用于打分（driving 为默认零改动）；前端新增「出行方式偏好」选择器。
+- **埋点扩展**（`tracer.js` schema `1.3.0 → 1.4.0`）：新增 `strategy_select`（策略/是否用户指定/交通偏好）、`scoring`（候选数/最优分/得分构成）、`alternative_compare`（chosen/rejected/scoreGap/tradeoff）三类事件，复用统一 emit 通道。
+- 测试：新增 `tests/scoring.test.js`（7 例）；扩展 `tests/agent-planner.test.js`（候选剪枝/聚类分天/按日口径/解释/对比）与 `tests/repair.test.js`（策略联动）；`package.json` test 脚本纳入 `scoring.test.js`；全量 `node --test` 通过（**87/87**）。手工 smoke：服务正常启动、`/api/strategies` 200。
+
+修改时间：2026-08-10 17:20 (UTC+8)

@@ -1,5 +1,7 @@
 "use strict";
 
+var scoring = require("./scoring.js");
+
 function normalizeName(name) {
   return String(name || "").trim().toLowerCase();
 }
@@ -469,38 +471,71 @@ function computeRouteMetrics(order, placeMetaMap, getTravelMin) {
   };
 }
 
-function scoreRoute(metrics, strategy) {
-  var tmpl = getStrategyTemplate(strategy);
-  var w = tmpl.weights;
-  var m = metrics || {};
-  return (
-    (w.travel * (Number(m.totalTravelMin) || 0)) +
-    (w.crossCity * (Number(m.crossCityCount) || 0) * 60) +
-    (w.backtrack * (Number(m.backtrackCount) || 0) * 60) -
-    (w.priority * (Number(m.priorityScore) || 0) * 15)
-  );
+// v1.4 P2：交通模式偏好 → 权重乘子。默认 driving（不改动，回归零 diff）；
+// walking 更在意距离与跨城，transit 更在意换乘/跨城。乘子作用于归一化后的加权项。
+var TRANSPORT_WEIGHT_MODIFIERS = {
+  driving: {},
+  transit: { crossCity: 1.3 },
+  walking: { travel: 1.4, crossCity: 1.2 },
+};
+
+function applyTransportPreference(weights, transportPreference) {
+  var w = weights || {};
+  var pref = String(transportPreference || "driving").trim().toLowerCase();
+  var mod = TRANSPORT_WEIGHT_MODIFIERS[pref];
+  if (!mod) {
+    return Object.assign({}, w);
+  }
+  return {
+    travel: (Number(w.travel) || 0) * (mod.travel || 1),
+    crossCity: (Number(w.crossCity) || 0) * (mod.crossCity || 1),
+    backtrack: (Number(w.backtrack) || 0) * (mod.backtrack || 1),
+    priority: (Number(w.priority) || 0) * (mod.priority || 1),
+  };
 }
 
-function chooseBestOrder(candidates, placeMetaMap, getTravelMin, strategy) {
+// v1.4：统一评分器口径。scoreRouteDetailed 返回 { score, breakdown, normalized }，
+// scoreRoute 保留返回数值的向后兼容签名（内部委托，避免双份评分公式漂移）。
+// transportPreference 为可选（P2）：默认 driving 时权重不变。
+function scoreRouteDetailed(metrics, strategy, transportPreference) {
+  var tmpl = getStrategyTemplate(strategy);
+  var weights = applyTransportPreference(tmpl.weights, transportPreference);
+  return scoring.scoreMetrics(metrics, weights);
+}
+
+function scoreRoute(metrics, strategy, transportPreference) {
+  return scoreRouteDetailed(metrics, strategy, transportPreference).score;
+}
+
+function chooseBestOrder(candidates, placeMetaMap, getTravelMin, strategy, transportPreference) {
   var list = (Array.isArray(candidates) ? candidates : []).filter(function (candidate) {
     return candidate && Array.isArray(candidate.order) && candidate.order.length;
   });
   if (!list.length) {
     return null;
   }
-  var best = null;
-  list.forEach(function (candidate) {
+  var scored = list.map(function (candidate) {
     var metrics = computeRouteMetrics(candidate.order, placeMetaMap, getTravelMin);
-    var cost = scoreRoute(metrics, strategy);
-    if (!best || cost < best.cost) {
-      best = {
-        source: candidate.source || "unknown",
-        order: candidate.order.slice(),
-        metrics: metrics,
-        cost: cost,
-      };
-    }
+    var detail = scoreRouteDetailed(metrics, strategy, transportPreference);
+    return {
+      source: candidate.source || "unknown",
+      order: candidate.order.slice(),
+      metrics: metrics,
+      cost: detail.score,
+      breakdown: detail.breakdown,
+      normalized: detail.normalized,
+    };
   });
+  // 稳定排序：分数相同时保留输入先后（LLM 候选优先），便于可解释与回归稳定。
+  scored.sort(function (a, b) {
+    if (a.cost === b.cost) {
+      return 0;
+    }
+    return a.cost - b.cost;
+  });
+  var best = Object.assign({}, scored[0]);
+  best.secondBest = scored[1] || null;
+  best.candidates = scored;
   return best;
 }
 
@@ -549,6 +584,139 @@ function buildGreedyOrder(placeNames, placeMetaMap, getTravelMin, strategy) {
   return result;
 }
 
+// v1.4 OI-1 根治（方向B，cluster-then-assign 的 cluster 步）：
+// 把顺序按城市稳定聚类（首次出现的城市顺序、城内保留相对次序），
+// 让「先聚类、再连续分块」后同城景点落在同一天，从源头消除每日无谓跨城往返。
+// 无城市信息时（全部 __unknown__）退化为原顺序，行为与旧连续分块一致。
+function clusterOrderByCity(order, placeMetaMap) {
+  var names = (Array.isArray(order) ? order : []).filter(Boolean);
+  var meta = placeMetaMap || {};
+  var cityOrder = [];
+  var grouped = {};
+  names.forEach(function (name) {
+    var city = metaCity(meta, name) || "__unknown__";
+    if (!grouped[city]) {
+      grouped[city] = [];
+      cityOrder.push(city);
+    }
+    grouped[city].push(name);
+  });
+  var out = [];
+  cityOrder.forEach(function (city) {
+    out = out.concat(grouped[city]);
+  });
+  return out;
+}
+
+// v1.4 OI-1 根治（方向C，按日打分口径）：以「按日分组 + 每日回酒店」为口径统计跨城，
+// 只计入同一日内相邻 visit 的跨城切换（天与天之间会回酒店，不产生真实跨城）。
+// 仅用于结果上报/埋点，不改变 verifier 判定阈值。
+function computeDailyMetrics(planData, placeMetaMap, getTravelMin) {
+  var plan = Array.isArray(planData) ? planData : [];
+  var meta = placeMetaMap || {};
+  var lookup = typeof getTravelMin === "function" ? getTravelMin : function () { return null; };
+  var crossCityByDay = [];
+  var totalCrossCityWithinDay = 0;
+  var totalTravelMin = 0;
+
+  plan.forEach(function (dayPlan) {
+    var items = (Array.isArray(dayPlan.items) ? dayPlan.items : []).filter(function (item) {
+      return item && item.type === "visit";
+    });
+    var dayCross = 0;
+    var i;
+    for (i = 1; i < items.length; i += 1) {
+      var prevName = items[i - 1].title;
+      var curName = items[i].title;
+      var prevCity = metaCity(meta, prevName);
+      var curCity = metaCity(meta, curName);
+      if (prevCity && curCity && prevCity !== curCity) {
+        dayCross += 1;
+      }
+      var travel = lookup(prevName, curName);
+      var travelMin = Number.isFinite(Number(travel)) && Number(travel) > 0
+        ? Number(travel)
+        : (prevCity && curCity && prevCity === curCity ? 30 : 120);
+      totalTravelMin += travelMin;
+    }
+    crossCityByDay.push({ day: Number(dayPlan.day) || (crossCityByDay.length + 1), crossCity: dayCross });
+    totalCrossCityWithinDay += dayCross;
+  });
+
+  return {
+    crossCityByDay: crossCityByDay,
+    totalCrossCityWithinDay: totalCrossCityWithinDay,
+    totalTravelMin: totalTravelMin,
+  };
+}
+
+// v1.4 候选生成：按优先级（high→low）稳定排序的候选顺序。
+function buildPriorityOrder(placeNames, placeMetaMap) {
+  var names = (Array.isArray(placeNames) ? placeNames : []).filter(Boolean);
+  var meta = placeMetaMap || {};
+  function rank(name) {
+    var m = meta[normalizeName(name)] || {};
+    var p = String(m.priority || "medium").toLowerCase();
+    return p === "high" ? 3 : (p === "low" ? 1 : 2);
+  }
+  // 稳定排序：优先级相同者保留原始先后（decorate-sort-undecorate）。
+  return names
+    .map(function (name, idx) { return { name: name, idx: idx, rank: rank(name) }; })
+    .sort(function (a, b) {
+      if (a.rank !== b.rank) {
+        return b.rank - a.rank;
+      }
+      return a.idx - b.idx;
+    })
+    .map(function (item) { return item.name; });
+}
+
+function orderSignature(order) {
+  return (Array.isArray(order) ? order : []).map(normalizeName).join(">");
+}
+
+// v1.4 候选生成 + 剪枝（doc §8.1）：多路候选 → 去重 → 上限 K 截断，防组合爆炸。
+// 候选来源：① 基准顺序（通常为 LLM 输出）；② 各策略贪心；③ 按优先级；④ 调用方注入的额外候选。
+// 段间时长通过 getTravelMin（内部走工具缓存）计算，不重复调用外部工具。
+function generateCandidateOrders(baseOrder, placeMetaMap, getTravelMin, strategy, options) {
+  var opts = options || {};
+  var K = Number.isFinite(Number(opts.K)) ? Number(opts.K) : 20;
+  var names = (Array.isArray(baseOrder) ? baseOrder : []).filter(Boolean);
+  var meta = placeMetaMap || {};
+  var candidates = [];
+
+  function add(source, order) {
+    var arr = (Array.isArray(order) ? order : []).filter(Boolean);
+    if (arr.length !== names.length || !arr.length) {
+      // 候选必须覆盖全部景点（同集合不同序），否则丢弃，避免误删点。
+      return;
+    }
+    candidates.push({ source: source, order: arr });
+  }
+
+  add("llm", names);
+  Object.keys(STRATEGY_TEMPLATES).forEach(function (sid) {
+    add("greedy-" + sid, buildGreedyOrder(names, meta, getTravelMin, sid));
+  });
+  add("priority", buildPriorityOrder(names, meta));
+  (Array.isArray(opts.extra) ? opts.extra : []).forEach(function (c) {
+    add((c && c.source) || "extra", c && c.order);
+  });
+
+  // 去重（顺序等价只保留一个，保留最先出现者）。
+  var seen = {};
+  var deduped = [];
+  candidates.forEach(function (c) {
+    var sig = orderSignature(c.order);
+    if (!seen[sig]) {
+      seen[sig] = true;
+      deduped.push(c);
+    }
+  });
+
+  return deduped.slice(0, Math.max(1, K));
+}
+
 function buildStrategyExplanation(strategy, metrics, source) {
   var tmpl = getStrategyTemplate(strategy);
   var m = metrics || {};
@@ -563,6 +731,147 @@ function buildStrategyExplanation(strategy, metrics, source) {
     parts.push("后端打分器已在模型建议顺序与策略候选顺序中择优。");
   }
   return parts.join("");
+}
+
+// v1.4 结构化策略解释：所选策略 + 得分构成 + 与次优方案的对比（为什么更优）。
+// 依赖 chooseBestOrder 返回的 chosenRoute（含 breakdown 与 secondBest）。
+var EXPLAIN_DIM_LABEL = {
+  travel: "总通勤更短",
+  crossCity: "跨城更少",
+  backtrack: "折返更少",
+  priority: "高优先级景点更靠前",
+};
+
+function buildStrategyExplanationDetail(strategy, chosenRoute) {
+  var tmpl = getStrategyTemplate(strategy);
+  var chosen = chosenRoute || {};
+  var second = chosen.secondBest || null;
+  var chosenScore = Number.isFinite(Number(chosen.cost)) ? Number(chosen.cost) : null;
+  var scoreGap = null;
+  if (second && Number.isFinite(Number(second.cost)) && chosenScore !== null) {
+    scoreGap = Number(second.cost) - chosenScore; // >=0：所选方案领先次优的分差（分越低越好）
+  }
+
+  var reason = "";
+  if (second && chosen.breakdown && second.breakdown) {
+    // 找出所选方案相对次优「改善最大」的维度（second - chosen > 0 表示所选更优，对四维统一成立）。
+    var dims = ["travel", "crossCity", "backtrack", "priority"];
+    var bestDim = null;
+    var bestDiff = -Infinity;
+    dims.forEach(function (dim) {
+      var diff = (Number(second.breakdown[dim]) || 0) - (Number(chosen.breakdown[dim]) || 0);
+      if (diff > bestDiff) {
+        bestDiff = diff;
+        bestDim = dim;
+      }
+    });
+    if (bestDim && bestDiff > 1e-9) {
+      reason = "相比次优候选（" + (second.source || "候选") + "），本方案在「" + EXPLAIN_DIM_LABEL[bestDim] + "」上更优" +
+        (scoreGap !== null ? "，综合得分领先 " + scoreGap.toFixed(3) : "") + "。";
+    } else if (scoreGap !== null) {
+      reason = "本方案综合得分领先次优候选 " + scoreGap.toFixed(3) + "。";
+    }
+  } else {
+    reason = "仅有单一候选方案，已直接采用。";
+  }
+
+  return {
+    strategy: tmpl.id,
+    strategyLabel: tmpl.label,
+    description: tmpl.description,
+    chosenSource: chosen.source || null,
+    chosenScore: chosenScore,
+    chosenBreakdown: chosen.breakdown || null,
+    secondBest: second
+      ? { source: second.source || null, score: Number(second.cost), order: (second.order || []).slice() }
+      : null,
+    scoreGap: scoreGap,
+    reason: reason,
+  };
+}
+
+// v1.4 A/B 多方案对比：主方案 = 用户所选策略；对比方案 = 「次优策略」，
+// 定义为在同一候选集上、其最优顺序与主方案不同、且与主方案对比度最高的其他策略。
+// 对比度 = |跨城差| + |总通勤差|/60，deterministic 便于回归。
+function buildTradeoffNote(primaryMetrics, altMetrics) {
+  var p = primaryMetrics || {};
+  var a = altMetrics || {};
+  var bits = [];
+  var crossDelta = (Number(a.crossCityCount) || 0) - (Number(p.crossCityCount) || 0);
+  var travelDelta = Math.round((Number(a.totalTravelMin) || 0) - (Number(p.totalTravelMin) || 0));
+  if (crossDelta !== 0) {
+    bits.push("跨城 " + (crossDelta < 0 ? "减少 " + (-crossDelta) : "增加 " + crossDelta) + " 次");
+  }
+  if (travelDelta !== 0) {
+    bits.push("总通勤 " + (travelDelta < 0 ? "减少 " + (-travelDelta) : "增加 " + travelDelta) + " 分钟");
+  }
+  if (!bits.length) {
+    return "与主方案在关键指标上接近，主要差异在景点次序。";
+  }
+  return "相较主方案：" + bits.join("、") + "。";
+}
+
+function compareStrategies(candidateOrders, placeMetaMap, getTravelMin, userStrategy, transportPreference) {
+  var primary = chooseBestOrder(candidateOrders, placeMetaMap, getTravelMin, userStrategy, transportPreference);
+  if (!primary) {
+    return null;
+  }
+  var userId = getStrategyTemplate(userStrategy).id;
+  var primarySig = orderSignature(primary.order);
+  var others = Object.keys(STRATEGY_TEMPLATES).filter(function (id) {
+    return id !== userId;
+  });
+  var alt = null;
+  others.forEach(function (sid) {
+    var best = chooseBestOrder(candidateOrders, placeMetaMap, getTravelMin, sid, transportPreference);
+    if (!best || orderSignature(best.order) === primarySig) {
+      return;
+    }
+    var contrast = Math.abs((best.metrics.crossCityCount || 0) - (primary.metrics.crossCityCount || 0)) +
+      Math.abs((best.metrics.totalTravelMin || 0) - (primary.metrics.totalTravelMin || 0)) / 60;
+    if (!alt || contrast > alt.contrast) {
+      alt = {
+        strategy: sid,
+        strategyLabel: getStrategyTemplate(sid).label,
+        description: getStrategyTemplate(sid).description,
+        order: best.order.slice(),
+        metrics: best.metrics,
+        score: best.cost,
+        contrast: contrast,
+      };
+    }
+  });
+
+  var result = {
+    primary: {
+      strategy: userId,
+      strategyLabel: getStrategyTemplate(userId).label,
+      order: primary.order.slice(),
+      metrics: {
+        totalTravelMin: primary.metrics.totalTravelMin,
+        crossCityCount: primary.metrics.crossCityCount,
+        backtrackCount: primary.metrics.backtrackCount,
+      },
+      score: primary.cost,
+    },
+    runnerUp: null,
+  };
+  if (alt) {
+    result.runnerUp = {
+      strategy: alt.strategy,
+      strategyLabel: alt.strategyLabel,
+      description: alt.description,
+      order: alt.order,
+      metrics: {
+        totalTravelMin: alt.metrics.totalTravelMin,
+        crossCityCount: alt.metrics.crossCityCount,
+        backtrackCount: alt.metrics.backtrackCount,
+      },
+      score: alt.score,
+      tradeoff: buildTradeoffNote(primary.metrics, alt.metrics),
+    };
+  }
+  return result;
 }
 
 function parseTransitLegs(directionsResponse) {
@@ -693,8 +1002,17 @@ module.exports = {
   listStrategyTemplates: listStrategyTemplates,
   computeRouteMetrics: computeRouteMetrics,
   scoreRoute: scoreRoute,
+  scoreRouteDetailed: scoreRouteDetailed,
+  applyTransportPreference: applyTransportPreference,
   chooseBestOrder: chooseBestOrder,
   buildGreedyOrder: buildGreedyOrder,
+  buildPriorityOrder: buildPriorityOrder,
+  clusterOrderByCity: clusterOrderByCity,
+  computeDailyMetrics: computeDailyMetrics,
+  generateCandidateOrders: generateCandidateOrders,
+  orderSignature: orderSignature,
   buildStrategyExplanation: buildStrategyExplanation,
+  buildStrategyExplanationDetail: buildStrategyExplanationDetail,
+  compareStrategies: compareStrategies,
   parseTransitLegs: parseTransitLegs,
 };

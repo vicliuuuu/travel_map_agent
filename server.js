@@ -14,6 +14,8 @@ var stateMachine = require("./state-machine.js");
 // v1.3 收敛控制参数（可用环境变量覆盖，便于回归调参）
 var MAX_REPAIR_ROUNDS = Number(process.env.MAX_REPAIR_ROUNDS || repair.MAX_REPAIR_ROUNDS);
 var NO_IMPROVE_LIMIT = Number(process.env.NO_IMPROVE_LIMIT || repair.NO_IMPROVE_LIMIT);
+// v1.4 候选集合上限（防组合爆炸，可用环境变量覆盖便于调参）
+var CANDIDATE_LIMIT = Number(process.env.CANDIDATE_LIMIT || 20);
 // 状态机可视化调试端点开关：内测默认开启，正式上线可设 ENABLE_DEBUG_TRACE=false
 var ENABLE_DEBUG_TRACE = String(process.env.ENABLE_DEBUG_TRACE || "true").toLowerCase() !== "false";
 
@@ -907,6 +909,7 @@ function applyEnvKeyFallback(body) {
 // v1.3 修复上下文：为决策器/修复动作提供当前 planData 的城市、优先级与单日景点数查询
 function buildRepairContext(ctx) {
   return {
+    strategy: ctx.strategyTemplate.id,
     cityOf: function (name) {
       var meta = ctx.placeMetaMap[agentPlanner.normalizeName(name)] || {};
       return meta.city || "";
@@ -914,6 +917,11 @@ function buildRepairContext(ctx) {
     priorityOf: function (name) {
       var meta = ctx.placeMetaMap[agentPlanner.normalizeName(name)] || {};
       return meta.priority || "medium";
+    },
+    // v1.4 策略×修复联动：用「当前策略权重」对（修复后）顺序重打分，保证修复不破坏策略取向。
+    scoreOrder: function (order) {
+      var metrics = agentPlanner.computeRouteMetrics(order, ctx.placeMetaMap, ctx.travelLookup);
+      return agentPlanner.scoreRouteDetailed(metrics, ctx.strategyTemplate.id, ctx.body.transportPreference).score;
     },
     dayItemsCount: function (dayNumber) {
       var dayPlan = (Array.isArray(ctx.planData) ? ctx.planData : []).find(function (d) {
@@ -1046,14 +1054,21 @@ function assembleResult(ctx, options) {
   };
 
   var effectiveMetrics = agentPlanner.computeRouteMetrics(finalOrder, ctx.placeMetaMap, ctx.travelLookup);
-  var strategyExplanation = agentPlanner.buildStrategyExplanation(
+  // v1.4 OI-1（方向C）：按日分组口径的跨城统计，反映「每日回酒店」后的真实同日跨城次数。
+  var dailyMetrics = agentPlanner.computeDailyMetrics(ctx.planData, ctx.placeMetaMap, ctx.travelLookup);
+  var strategyExplanationText = agentPlanner.buildStrategyExplanation(
     strategyTemplate.id,
     effectiveMetrics,
     ctx.chosenRoute ? ctx.chosenRoute.source : "llm"
   );
-  var combinedRouteStrategy = analysis.routeStrategy
-    ? (strategyExplanation + " " + analysis.routeStrategy)
-    : strategyExplanation;
+  // v1.4 结构化策略解释（含次优对比与 scoreGap）
+  var strategyExplanation = agentPlanner.buildStrategyExplanationDetail(
+    strategyTemplate.id,
+    ctx.chosenRoute
+  );
+  var combinedRouteStrategy = [strategyExplanationText, strategyExplanation.reason, analysis.routeStrategy]
+    .filter(Boolean)
+    .join(" ");
 
   // v1.3.1 第二方案（仅 gap==1 时构建）：结构完整、可与主方案上下堆叠展示
   var alternativePlan = null;
@@ -1091,10 +1106,14 @@ function assembleResult(ctx, options) {
     routeStrategy: combinedRouteStrategy,
     strategy: strategyTemplate.id,
     strategyLabel: strategyTemplate.label,
+    strategyExplanation: strategyExplanation,
+    strategyComparison: ctx.strategyComparison || null,
     routeMetrics: {
       totalTravelMin: effectiveMetrics.totalTravelMin,
       crossCityCount: effectiveMetrics.crossCityCount,
       backtrackCount: effectiveMetrics.backtrackCount,
+      crossCityWithinDay: dailyMetrics.totalCrossCityWithinDay,
+      crossCityByDay: dailyMetrics.crossCityByDay,
     },
     transitBreakdown: ctx.transitBreakdown,
     placeSpotlights: filterSpotlightsByOrder(analysis.placeSpotlights, finalOrderSet),
@@ -1191,16 +1210,56 @@ function buildPlanStates(ctx, pushProgress) {
         context.placeMetaMap = placeMetaMap;
         context.travelLookup = travelLookup;
 
-        var candidateOrders = [{ source: "llm", order: recommendedOrder }];
-        var greedyOrder = agentPlanner.buildGreedyOrder(recommendedOrder, placeMetaMap, travelLookup, strategyTemplate.id);
-        if (greedyOrder.length) {
-          candidateOrders.push({ source: "greedy-" + strategyTemplate.id, order: greedyOrder });
-        }
-        var chosenRoute = agentPlanner.chooseBestOrder(candidateOrders, placeMetaMap, travelLookup, strategyTemplate.id);
+        // v1.4 候选生成 + 剪枝：多路候选（LLM + 各策略贪心 + 优先级）去重后上限 K，防组合爆炸。
+        var candidateOrders = agentPlanner.generateCandidateOrders(
+          recommendedOrder,
+          placeMetaMap,
+          travelLookup,
+          strategyTemplate.id,
+          { K: CANDIDATE_LIMIT }
+        );
+        var chosenRoute = agentPlanner.chooseBestOrder(candidateOrders, placeMetaMap, travelLookup, strategyTemplate.id, body.transportPreference);
         if (chosenRoute && chosenRoute.order.length) {
           recommendedOrder = chosenRoute.order;
         }
+        // v1.4 OI-1 根治（方向B）：对最终顺序按城市聚类，作为唯一顺序源向下游（enrichedPlaces/
+        // 分天/planData/roadbook）一致传导，确保「先聚类、再连续分块」后同城景点同日、消除无谓跨城。
+        recommendedOrder = agentPlanner.clusterOrderByCity(recommendedOrder, placeMetaMap);
         context.chosenRoute = chosenRoute;
+        context.tracer.emit({
+          stage: "plan_initial",
+          eventType: "scoring",
+          status: "ok",
+          payload: {
+            strategy: strategyTemplate.id,
+            candidateCount: candidateOrders.length,
+            bestScore: chosenRoute ? chosenRoute.cost : null,
+            bestSource: chosenRoute ? chosenRoute.source : null,
+            scoreBreakdown: chosenRoute ? chosenRoute.breakdown : null,
+          },
+        });
+
+        // v1.4 A/B 多方案：用户所选策略 vs 次优策略（同候选集上另一策略的最优、与主方案差异最大者）。
+        context.strategyComparison = agentPlanner.compareStrategies(
+          candidateOrders,
+          placeMetaMap,
+          travelLookup,
+          strategyTemplate.id,
+          body.transportPreference
+        );
+        if (context.strategyComparison && context.strategyComparison.runnerUp) {
+          context.tracer.emit({
+            stage: "plan_initial",
+            eventType: "alternative_compare",
+            status: "ok",
+            payload: {
+              chosen: context.strategyComparison.primary.strategy,
+              rejected: context.strategyComparison.runnerUp.strategy,
+              scoreGap: context.strategyComparison.runnerUp.score - context.strategyComparison.primary.score,
+              tradeoff: context.strategyComparison.runnerUp.tradeoff,
+            },
+          });
+        }
 
         var enrichedPlaces = agentPlanner.applyAgentInsights(
           normalized.places,
@@ -1309,11 +1368,15 @@ function buildPlanStates(ctx, pushProgress) {
           });
         }
         context.repairRounds += 1;
+        // v1.4 策略×修复联动：用当前策略权重对修复后方案重打分，写入 trace 供复盘「修复是否符合策略取向」。
+        var afterStrategyScore = repair.rescorePlanWithStrategy(context.planData, context.repairContext);
+        context.strategyScoreHistory.push(afterStrategyScore);
         context.tracer.repairAction({
           action: applied.changeLog.action,
           reason: context.pendingRepair.failure.code,
           beforeScore: beforeScore,
-          afterScore: null,
+          afterScore: afterStrategyScore,
+          strategy: context.repairContext.strategy,
           diff: applied.changeLog,
         });
         pushProgress({
@@ -1381,6 +1444,7 @@ async function buildAgentPlanPayload(rawBody, reportProgress) {
     strategyTemplate: strategyTemplate,
     tracer: requestTracer,
     scoreHistory: [],
+    strategyScoreHistory: [],
     repairRounds: 0,
     repairChangeLogs: [],
     droppedByRepair: [],
@@ -1391,6 +1455,18 @@ async function buildAgentPlanPayload(rawBody, reportProgress) {
     result: null,
   };
   ctx.repairContext = buildRepairContext(ctx);
+
+  // v1.4 策略选择埋点：记录最终采用的策略、是否用户指定、交通模式偏好，供策略使用分布分析。
+  requestTracer.emit({
+    stage: "collect_input",
+    eventType: "strategy_select",
+    status: "ok",
+    payload: {
+      strategy: strategyTemplate.id,
+      isUserSpecified: Boolean(body.strategy),
+      transportPreference: String(body.transportPreference || "driving").toLowerCase(),
+    },
+  });
 
   var states = buildPlanStates(ctx, pushProgress);
   try {

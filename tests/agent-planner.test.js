@@ -283,6 +283,176 @@ test("buildGreedyOrder clusters same-city places for least-transfer", () => {
   assert.equal(order[2], "B");
 });
 
+test("clusterOrderByCity groups same-city contiguously, fixing OI-1 for any strategy (v1.4)", () => {
+  // fastest 策略可能给出「城市交错」的顺序（哥→马→哥→马），聚类后应同城连续。
+  const meta = {
+    "小美人鱼": { city: "Copenhagen" },
+    "马尔默竞技场": { city: "Malmo" },
+    "市政厅": { city: "Copenhagen" },
+    "利姆港": { city: "Malmo" },
+  };
+  const interleaved = ["小美人鱼", "马尔默竞技场", "市政厅", "利姆港"];
+  const clustered = agentPlanner.clusterOrderByCity(interleaved, meta);
+  // 首次出现的城市顺序：Copenhagen 在前、Malmo 在后；城内保留相对次序。
+  assert.deepEqual(clustered, ["小美人鱼", "市政厅", "马尔默竞技场", "利姆港"]);
+});
+
+test("cluster-then-assign yields zero same-day cross-city (OI-1 root fix, v1.4)", () => {
+  const meta = {
+    "小美人鱼": { city: "Copenhagen" },
+    "马尔默竞技场": { city: "Malmo" },
+    "市政厅": { city: "Copenhagen" },
+    "利姆港": { city: "Malmo" },
+  };
+  const interleaved = ["小美人鱼", "马尔默竞技场", "市政厅", "利姆港"];
+  const clustered = agentPlanner.clusterOrderByCity(interleaved, meta);
+  const places = clustered.map((name) => ({ name }));
+  const planData = agentPlanner.buildPlanDataFromOrder(clustered, places, "", 2);
+  const daily = agentPlanner.computeDailyMetrics(planData, meta, () => null);
+  // Day1 全哥本哈根、Day2 全马尔默 → 同日跨城为 0。
+  assert.equal(daily.totalCrossCityWithinDay, 0);
+  assert.deepEqual(planData[0].items.map((i) => i.title), ["小美人鱼", "市政厅"]);
+  assert.deepEqual(planData[1].items.map((i) => i.title), ["马尔默竞技场", "利姆港"]);
+});
+
+test("clusterOrderByCity is a no-op without city info (keeps old behavior)", () => {
+  const order = ["A", "B", "C", "D"];
+  assert.deepEqual(agentPlanner.clusterOrderByCity(order, {}), order);
+});
+
+test("computeDailyMetrics counts within-day cross-city only", () => {
+  const meta = { a: { city: "X" }, b: { city: "Y" }, c: { city: "X" } };
+  const planData = [
+    { day: 1, items: [{ type: "visit", title: "A" }, { type: "visit", title: "B" }] },
+    { day: 2, items: [{ type: "visit", title: "C" }] },
+  ];
+  const daily = agentPlanner.computeDailyMetrics(planData, meta, () => null);
+  // Day1 A(X)→B(Y) 1 次同日跨城；Day2 单点 0 次。天与天之间不计。
+  assert.equal(daily.totalCrossCityWithinDay, 1);
+  assert.deepEqual(daily.crossCityByDay, [{ day: 1, crossCity: 1 }, { day: 2, crossCity: 0 }]);
+});
+
+test("buildPriorityOrder sorts high→low stably (v1.4)", () => {
+  const meta = {
+    a: { priority: "low" },
+    b: { priority: "high" },
+    c: { priority: "medium" },
+    d: { priority: "high" },
+  };
+  // 高优先级 B、D 提前且保留原始先后；medium C 次之；low A 最后。
+  const order = agentPlanner.buildPriorityOrder(["A", "B", "C", "D"], meta);
+  assert.deepEqual(order, ["B", "D", "C", "A"]);
+});
+
+test("generateCandidateOrders dedups and stays within K (v1.4)", () => {
+  const meta = {
+    a: { city: "X", priority: "high" },
+    b: { city: "Y", priority: "low" },
+    c: { city: "X", priority: "medium" },
+  };
+  const candidates = agentPlanner.generateCandidateOrders(
+    ["A", "B", "C"],
+    meta,
+    () => null,
+    "least-transfer",
+    { K: 20 }
+  );
+  // 至少包含 llm 基准候选。
+  assert.equal(candidates.some((c) => c.source === "llm"), true);
+  // 所有候选都必须覆盖全部 3 个景点（同集合不同序，不丢点）。
+  candidates.forEach((c) => {
+    assert.equal(c.order.length, 3);
+    assert.deepEqual([...c.order].sort(), ["A", "B", "C"]);
+  });
+  // 去重：不存在两个顺序完全相同的候选。
+  const sigs = candidates.map((c) => agentPlanner.orderSignature(c.order));
+  assert.equal(new Set(sigs).size, sigs.length);
+  // 受控：不超过 K。
+  assert.equal(candidates.length <= 20, true);
+});
+
+test("generateCandidateOrders respects small K cap (v1.4)", () => {
+  const meta = { a: { city: "X" }, b: { city: "Y" }, c: { city: "Z" }, d: { city: "W" } };
+  const candidates = agentPlanner.generateCandidateOrders(
+    ["A", "B", "C", "D"],
+    meta,
+    () => null,
+    "fastest",
+    { K: 2 }
+  );
+  assert.equal(candidates.length <= 2, true);
+});
+
+test("chooseBestOrder exposes breakdown and secondBest (v1.4)", () => {
+  const meta = { a: { city: "X" }, b: { city: "Y" }, c: { city: "X" } };
+  const chosen = agentPlanner.chooseBestOrder(
+    [
+      { source: "llm", order: ["A", "B", "C"] },
+      { source: "greedy", order: ["A", "C", "B"] },
+    ],
+    meta,
+    () => null,
+    "least-transfer"
+  );
+  assert.equal(typeof chosen.breakdown === "object" && chosen.breakdown !== null, true);
+  assert.equal(chosen.secondBest !== null, true);
+  assert.equal(chosen.secondBest.cost >= chosen.cost, true);
+  assert.equal(Array.isArray(chosen.candidates), true);
+});
+
+test("buildStrategyExplanationDetail explains why chosen beats second best (v1.4)", () => {
+  const meta = { a: { city: "X" }, b: { city: "Y" }, c: { city: "X" } };
+  const chosen = agentPlanner.chooseBestOrder(
+    [
+      { source: "llm", order: ["A", "B", "C"] },
+      { source: "greedy", order: ["A", "C", "B"] },
+    ],
+    meta,
+    () => null,
+    "least-transfer"
+  );
+  const detail = agentPlanner.buildStrategyExplanationDetail("least-transfer", chosen);
+  assert.equal(detail.strategy, "least-transfer");
+  assert.equal(detail.secondBest !== null, true);
+  assert.equal(detail.scoreGap >= 0, true);
+  assert.equal(typeof detail.reason === "string" && detail.reason.length > 0, true);
+  assert.equal(detail.chosenBreakdown !== null, true);
+});
+
+test("buildStrategyExplanationDetail handles single candidate gracefully (v1.4)", () => {
+  const detail = agentPlanner.buildStrategyExplanationDetail("fastest", {
+    source: "llm",
+    order: ["A"],
+    cost: 1.23,
+    breakdown: { travel: 1.23, crossCity: 0, backtrack: 0, priority: 0 },
+    secondBest: null,
+  });
+  assert.equal(detail.secondBest, null);
+  assert.equal(detail.scoreGap, null);
+  assert.equal(detail.reason.includes("单一候选"), true);
+});
+
+test("compareStrategies returns primary=user strategy and a contrasting runner-up (v1.4)", () => {
+  const meta = {
+    a: { city: "X", priority: "low" },
+    b: { city: "Y", priority: "high" },
+    c: { city: "X", priority: "medium" },
+  };
+  const candidates = agentPlanner.generateCandidateOrders(["A", "B", "C"], meta, () => null, "least-transfer", { K: 20 });
+  const cmp = agentPlanner.compareStrategies(candidates, meta, () => null, "least-transfer");
+  assert.equal(cmp.primary.strategy, "least-transfer");
+  assert.equal(Array.isArray(cmp.primary.order), true);
+  if (cmp.runnerUp) {
+    // 次优策略必须是其他策略，且顺序与主方案不同。
+    assert.notEqual(cmp.runnerUp.strategy, "least-transfer");
+    assert.notEqual(
+      agentPlanner.orderSignature(cmp.runnerUp.order),
+      agentPlanner.orderSignature(cmp.primary.order)
+    );
+    assert.equal(typeof cmp.runnerUp.tradeoff === "string", true);
+  }
+});
+
 test("parseTransitLegs extracts walk and transit legs", () => {
   const parsed = agentPlanner.parseTransitLegs({
     routes: [

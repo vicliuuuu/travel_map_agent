@@ -68,6 +68,14 @@
           <option value="classic">经典打卡优先（不走回头路 + 高优先级）</option>
         </select>
       </label>
+      <label>
+        出行方式偏好
+        <select id="transportSelect">
+          <option value="driving" selected>驾车（默认）</option>
+          <option value="transit">公共交通（更在意换乘/跨城）</option>
+          <option value="walking">步行（更在意距离/跨城）</option>
+        </select>
+      </label>
       <button id="llmAnalyzeBtn" type="button">先用 LLM 分析景点时长</button>
       <button id="agentPlanBtn" type="button">Agent 智能规划（LLM + Google Maps）</button>
       <div id="planProgressWrap" class="plan-progress hidden">

@@ -41,6 +41,7 @@
     daysInput: document.getElementById("daysInput"),
     visitMinutesInput: document.getElementById("visitMinutesInput"),
     strategySelect: document.getElementById("strategySelect"),
+    transportSelect: document.getElementById("transportSelect"),
     statusText: document.getElementById("statusText"),
     placesList: document.getElementById("placesList"),
     itineraryResult: document.getElementById("itineraryResult"),
@@ -465,6 +466,7 @@
       totalDays: Number(ui.daysInput.value),
       visitMinutes: Number(ui.visitMinutesInput.value),
       strategy: ui.strategySelect ? ui.strategySelect.value : "fastest",
+      transportPreference: ui.transportSelect ? ui.transportSelect.value : "driving",
     };
   }
 
@@ -1075,6 +1077,24 @@
       "</section>"
     );
 
+    // v1.4 策略对比（A/B）：用户所选策略 vs 次优策略，仅在存在有差异的次优方案时展示。
+    var comparison = agentResult.strategyComparison;
+    if (comparison && comparison.runnerUp) {
+      var explain = agentResult.strategyExplanation || {};
+      var reasonLine = explain.reason
+        ? ("<p class=\"overview-summary\">" + escapeHtml(explain.reason) + "</p>")
+        : "";
+      sections.push(
+        "<section class=\"roadbook-section roadbook-strategy-compare\">" +
+        "<h3>策略对比</h3>" +
+        "<p><strong>当前采用：</strong>「" + escapeHtml(comparison.primary.strategyLabel || comparison.primary.strategy) + "」</p>" +
+        reasonLine +
+        "<p><strong>另可选择：</strong>「" + escapeHtml(comparison.runnerUp.strategyLabel || comparison.runnerUp.strategy) + "」——" +
+        escapeHtml(comparison.runnerUp.tradeoff || comparison.runnerUp.description || "") + "</p>" +
+        "</section>"
+      );
+    }
+
     var spotlights = Array.isArray(agentResult.placeSpotlights) ? agentResult.placeSpotlights : [];
     if (spotlights.length) {
       var spotlightHtml = spotlights.map(function (item, index) {
@@ -1320,6 +1340,7 @@
     var totalDays = tripInput.totalDays;
     var visitMinutes = tripInput.visitMinutes;
     var strategy = tripInput.strategy;
+    var transportPreference = tripInput.transportPreference;
     var places = tripInput.places;
     var mapsApiKey = ui.apiKeyInput.value.trim();
     var llmBaseUrl = ui.llmBaseUrlInput.value.trim();
@@ -1364,6 +1385,7 @@
           totalDays: totalDays,
           visitMinutes: visitMinutes,
           strategy: strategy,
+          transportPreference: transportPreference,
           places: places,
           destinations: tripInput.destinations,
           lodging: tripInput.lodging,

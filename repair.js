@@ -319,6 +319,25 @@ function noImprovement(scoreHistory, limit) {
   return stale >= threshold;
 }
 
+// v1.4 策略×修复联动：用「当前策略权重」对修复后的方案重打分（越低越符合策略取向）。
+// 通过 context.scoreOrder（由调用方注入，内部走统一评分器）实现，repair.js 不直接依赖打分器，
+// 保持解耦；未注入 scoreOrder 时返回 null（无静默失败：调用方据此判断是否可用）。
+function rescorePlanWithStrategy(planData, context) {
+  var ctx = context || {};
+  if (typeof ctx.scoreOrder !== "function") {
+    return null;
+  }
+  var order = [];
+  (Array.isArray(planData) ? planData : []).forEach(function (dayPlan) {
+    (Array.isArray(dayPlan.items) ? dayPlan.items : []).forEach(function (item) {
+      if (item && item.type === "visit" && item.title) {
+        order.push(item.title);
+      }
+    });
+  });
+  return ctx.scoreOrder(order);
+}
+
 function shouldStopRepair(state) {
   var s = state || {};
   var round = Number(s.round) || 0;
@@ -346,4 +365,5 @@ module.exports = {
   routeCodeToAction: routeCodeToAction,
   shouldStopRepair: shouldStopRepair,
   noImprovement: noImprovement,
+  rescorePlanWithStrategy: rescorePlanWithStrategy,
 };
