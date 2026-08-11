@@ -42,6 +42,7 @@
     visitMinutesInput: document.getElementById("visitMinutesInput"),
     strategySelect: document.getElementById("strategySelect"),
     transportSelect: document.getElementById("transportSelect"),
+    physicalSelect: document.getElementById("physicalSelect"),
     statusText: document.getElementById("statusText"),
     placesList: document.getElementById("placesList"),
     itineraryResult: document.getElementById("itineraryResult"),
@@ -467,6 +468,7 @@
       visitMinutes: Number(ui.visitMinutesInput.value),
       strategy: ui.strategySelect ? ui.strategySelect.value : "fastest",
       transportPreference: ui.transportSelect ? ui.transportSelect.value : "driving",
+      physicalPreference: ui.physicalSelect ? ui.physicalSelect.value : "standard",
     };
   }
 
@@ -884,6 +886,9 @@
       (Array.isArray(dayPlan.segments) ? dayPlan.segments : []).forEach(function (segment) {
         if (segment.type === "visit") {
           result.push("  - 游览 " + segment.placeName + (segment.visitTimeRange ? ("（" + segment.visitTimeRange + "）") : ""));
+          if (segment.openingHours && segment.openingHours.open && segment.openingHours.close && segment.openingHours.verifyState !== "unverified") {
+            result.push("      营业：" + segment.openingHours.open + "–" + segment.openingHours.close + "（来源 Google Places）");
+          }
         } else {
           result.push("  - 交通 " + segment.from + " -> " + segment.to + (segment.durationRange ? ("（" + segment.durationRange + "）") : ""));
           if (Array.isArray(segment.legs) && segment.legs.length) {
@@ -1004,6 +1009,19 @@
     return bits.join(" · ");
   }
 
+  // v1.5.2 #1：营业时间展示（自证使用了 Google Places API）。已核实显示"营业 HH:MM–HH:MM · 来源 Google Places"，
+  // 未核实/未获取显示灰字提示；无数据（工具关闭/未查该点）则不渲染任何内容。
+  function renderOpeningHours(oh) {
+    if (!oh) {
+      return "";
+    }
+    if (oh.open && oh.close && oh.verifyState !== "unverified") {
+      return "<p class=\"station-meta station-hours\">营业：" + escapeHtml(oh.open + "–" + oh.close) +
+        " · 来源 Google Places</p>";
+    }
+    return "<p class=\"station-meta station-hours station-hours-missing\">营业时间：未获取（未核实）</p>";
+  }
+
   function renderTransitConnector(segment) {
     var transitDetail = "";
     if (Array.isArray(segment.legs) && segment.legs.length) {
@@ -1032,6 +1050,7 @@
           return "<article class=\"station-card\">" +
             "<h5>第 " + stationNo + " 站 · " + escapeHtml(segment.placeName) + "</h5>" +
             (segment.visitTimeRange ? ("<p class=\"station-meta\">游玩：" + escapeHtml(segment.visitTimeRange) + "</p>") : "") +
+            renderOpeningHours(segment.openingHours) +
             "</article>";
         }
         return renderTransitConnector(segment);
@@ -1150,6 +1169,18 @@
       var lodgingWarnings = Array.isArray(validation.lodgingWarnings) ? validation.lodgingWarnings : [];
       var excluded = Array.isArray(validation.excludedPlaces) ? validation.excludedPlaces : [];
       var timeInfo = validation.timeFeasibility || {};
+      // v1.5 新增风险校验（闭馆/体力/回酒店往返）：从 findings 过滤展示，未核实项显式标注。
+      var v15Codes = { OPENING_RISK: "闭馆风险", PHYSICAL_OVERLOAD: "体力强度", HOTEL_RETURN_COST: "回酒店往返" };
+      var v15Findings = (Array.isArray(validation.findings) ? validation.findings : []).filter(function (f) {
+        return f && v15Codes[f.code];
+      });
+      var riskHtml = v15Findings.length
+        ? ("<p><strong>风险校验（v1.5）：</strong></p><ul>" + v15Findings.map(function (f) {
+            var tag = v15Codes[f.code] + (f.level === "error" ? "·必看" : "·提醒");
+            var unverified = f.evidence && f.evidence.verifyState === "unverified" ? "（未核实）" : "";
+            return "<li>[" + escapeHtml(tag) + "] " + escapeHtml(f.message || "") + escapeHtml(unverified) + "</li>";
+          }).join("") + "</ul>")
+        : "";
       sections.push(
         "<section class=\"roadbook-section\">" +
         "<h3>行程校验</h3>" +
@@ -1172,6 +1203,7 @@
               return "<li>" + escapeHtml(item) + "</li>";
             }).join("") + "</ul>")
           : "") +
+        riskHtml +
         "</section>"
       );
     }
@@ -1341,6 +1373,7 @@
     var visitMinutes = tripInput.visitMinutes;
     var strategy = tripInput.strategy;
     var transportPreference = tripInput.transportPreference;
+    var physicalPreference = tripInput.physicalPreference;
     var places = tripInput.places;
     var mapsApiKey = ui.apiKeyInput.value.trim();
     var llmBaseUrl = ui.llmBaseUrlInput.value.trim();
@@ -1386,6 +1419,7 @@
           visitMinutes: visitMinutes,
           strategy: strategy,
           transportPreference: transportPreference,
+          physicalPreference: physicalPreference,
           places: places,
           destinations: tripInput.destinations,
           lodging: tripInput.lodging,

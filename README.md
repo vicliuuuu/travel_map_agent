@@ -1,8 +1,8 @@
 # 旅行规划 Agent
 
-当前版本：**内测 v1.4.0**（详见 [`doc_auto/内测-v1.4-前瞻规划.md`](doc_auto/内测-v1.4-前瞻规划.md)）
+当前版本：**内测 v1.5.4**（详见 [`doc_auto/内测-v1.5-前瞻规划.md`](doc_auto/内测-v1.5-前瞻规划.md) 与 [`doc_auto/changes.md`](doc_auto/changes.md)）
 
-可本地运行、也可公网部署的旅行路线规划原型：支持多目的地层级输入、酒店锚点、地图标点与 Agent 智能路书；v1.2 引入策略引擎、跨城公共交通分段与酒店闭环硬约束，v1.3 把隐式流程升级为「显式状态机 + 自动修复闭环」并建立全链路 trace 埋点基线，v1.4 升级为「策略引擎（多策略打分 + 候选剪枝 + 打分兜底）」并根治 OI-1 跨城分天。
+可本地运行、也可公网部署的旅行路线规划原型：支持多目的地层级输入、酒店锚点、地图标点与 Agent 智能路书；v1.2 引入策略引擎、跨城公共交通分段与酒店闭环硬约束，v1.3 把隐式流程升级为「显式状态机 + 自动修复闭环」并建立全链路 trace 埋点基线，v1.4 升级为「策略引擎（多策略打分 + 候选剪枝 + 打分兜底）」并根治 OI-1 跨城分天，v1.5 把工具层扩展为「可插拔多事实源」（营业时间/天气/拥堵）并把校验层扩展到「闭馆风险/体力强度/回酒店往返成本」。
 
 ## 两种使用模式
 
@@ -27,6 +27,11 @@
 - **OI-1 分天根治（v1.4）**：cluster-then-assign 全局按城市聚类分天（任意策略下同城同日、消除无谓跨城）+ 按日分组口径跨城统计（`routeMetrics.crossCityByDay`）
 - **交通模式偏好（v1.4）**：请求体 `transportPreference: driving|transit|walking` 以权重乘子接入打分（driving 为默认）
 - **埋点扩展（v1.4）**：新增 strategy_select / scoring / alternative_compare 事件，trace schema 升至 1.4.0
+- **可插拔工具层（v1.5）**：统一 `Tool` 抽象 + `ToolRegistry`（幂等缓存/超时重试/错误码标准化/三级降级/来源标注），`opening_hours`（provider: google_places）/`weather`/`congestion` 按开关热插拔；`opening_hours`/`congestion` 默认开启、`weather` 默认关闭，失败自动降级不影响主流程（`tools.js`）
+- **营业时间展示（v1.5.2+）**：每个景点卡片下展示「营业：HH:MM–HH:MM · 来源 Google Places」（已核实）或「未获取（未核实）」，自证外部事实来源；`opening_hours` 查询以「名称 + 城市/国家」消歧、规范地址兜底，显著降低 `ZERO_RESULTS`
+- **校验层扩展（v1.5）**：`OPENING_RISK`（时间轴推算到达时刻判闭馆，未核实降级 warn）/`PHYSICAL_OVERLOAD`（单日体力强度）/`HOTEL_RETURN_COST`（回酒店往返成本），闭馆风险联动 `advance_place` 修复动作
+- **来源标注与降级（v1.5）**：外部事实统一带 `source/fetchedAt/verifyState`，工具不可用时 skip/conservative/fatal 分级降级（不静默），trace schema 升至 1.5.0（新增 fact_source / tool_degrade）
+- **全链路审计修复（v1.5.2+）**：外部事实工具并发化 + 超时放宽（压延迟/防限流）、用户级 `visitMinutes` 时长兜底生效、交付前重打分使策略解释与展示指标同源、缺城市元数据不再虚增跨城计数
 - **智能路书展示**：概述、路线策略、住宿摘要、按日路书、校验结果与替代方案
 - **LLM 供应商识别**：默认 DashScope（Qwen），兼容 OpenAI 等
 - **公网部署（v1.2）**：Docker/环境变量/CORS/限流，密钥可后端环境变量兜底（详见 [`deploy.md`](deploy.md)）
@@ -79,10 +84,31 @@ node server.js
 ## 测试
 
 ```bash
-node --test tests/planner.test.js tests/llm.test.js tests/agent-planner.test.js tests/location-data.test.js tests/verifier.test.js tests/repair.test.js tests/state-machine.test.js tests/tracer.test.js tests/day-plan.test.js tests/scoring.test.js
+node --test tests/planner.test.js tests/llm.test.js tests/agent-planner.test.js tests/location-data.test.js tests/verifier.test.js tests/repair.test.js tests/state-machine.test.js tests/tracer.test.js tests/day-plan.test.js tests/scoring.test.js tests/tools.test.js
 ```
 
 或直接 `npm test`（已包含全部测试文件）。
+
+## v1.5 工具/校验开关（环境变量）
+
+`opening_hours`/`congestion` **默认开启**、`weather` **默认关闭**（原因见下表）。`opening_hours`/`weather` 走 Google API（需对应权限），失败/地区不覆盖时自动降级并标注「未核实」，主流程不中断。`congestion` 默认走内置高峰启发式，无需额外 API。
+
+| 环境变量 | 默认 | 说明 |
+|----------|------|------|
+| `OPENING_HOURS_ENABLED` | `true` | 营业时间工具（provider: google_places，需 **Places API** 权限），供闭馆风险校验 |
+| `WEATHER_ENABLED` | `false` | 天气工具（provider: **Google Weather API**）。默认关闭：当前流程未采集实际出行日期，预报只能取"最近一天"意义不大。设 `true` 后**仅当填写入住日期**才会查询并并入注意事项 |
+| `CONGESTION_ENABLED` | `true` | 拥堵修正（内置高峰时段启发式：早/晚高峰放大通勤时长，作用于闭馆判定） |
+| `PHYSICAL_CHECK_ENABLED` | `true` | 单日体力强度校验（warn，纯计算，阈值由请求体 `physicalPreference` 决定） |
+| `HOTEL_RETURN_CHECK_ENABLED` | `true` | 回酒店往返成本校验（warn，纯计算，>35% 提醒） |
+| `DAY_START_MIN` | `540` | 每日出发基准时刻（分钟，默认 09:00），用于到达时刻推算 |
+| `TOOL_FETCH_CONCURRENCY` | `5` | 外部事实工具（营业时间/天气）并发拉取上限（并发压延迟 + 限流防撞配额） |
+| `OPENING_HOURS_TIMEOUT_MS` | `9000` | 营业时间单次调用超时（含 findplace+details 两跳，勿设过小以免误判降级） |
+| `WEATHER_TIMEOUT_MS` | `6000` | 天气单次调用超时 |
+| `OPENING_HOURS_SCOPE` | `all` | `all`=全部景点查营业时间；`high`=仅高优先级景点（省调用/省钱） |
+
+请求体新增可选字段：`physicalPreference: easy \| standard \| hardcore`（默认 `standard`），对应单日体力强度阈值 5h/4景点、7h/6景点、9h/8景点；前端「体力强度偏好」下拉可选。`visitMinutes`（每个景点默认游玩时长，分钟）现已生效：仅对模型未给出建议时长的景点作兜底（clamp 30~480）。
+
+> 注意：`opening_hours` 需在 Google Cloud 启用 **Places API（经典版）**，`weather` 需启用 **Weather API**，并把它们加入该 key 的 API 限制允许列表。
 
 ## 公网部署
 
@@ -95,4 +121,5 @@ node --test tests/planner.test.js tests/llm.test.js tests/agent-planner.test.js 
 - v1.2 规划与实现：[`doc_auto/内测-v1.2-改进规划.md`](doc_auto/内测-v1.2-改进规划.md)
 - v1.3 规划与实现：[`doc_auto/内测-v1.3-前瞻规划.md`](doc_auto/内测-v1.3-前瞻规划.md)
 - v1.4 规划与实现：[`doc_auto/内测-v1.4-前瞻规划.md`](doc_auto/内测-v1.4-前瞻规划.md)
+- v1.5 规划与实现：[`doc_auto/内测-v1.5-前瞻规划.md`](doc_auto/内测-v1.5-前瞻规划.md)
 - 变更记录：[`doc_auto/changes.md`](doc_auto/changes.md)

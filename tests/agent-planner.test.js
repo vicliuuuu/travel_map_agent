@@ -162,6 +162,44 @@ test("buildDailyPlansFromPlanData keeps visits and hotel loop", () => {
   assert.equal(dailyPlans[0].closedLoop, true);
 });
 
+// v1.5.2 #1：营业时间透出到 visit 段
+test("buildDailyPlansFromPlanData attaches opening hours to visit segments (#1)", () => {
+  const dailyPlans = agentPlanner.buildDailyPlansFromPlanData(
+    [
+      {
+        day: 1,
+        items: [
+          { type: "visit", title: "故宫", durationMin: 120 },
+          { type: "visit", title: "景山公园", durationMin: 60 },
+        ],
+      },
+    ],
+    { mode: "none" },
+    1,
+    {
+      openingHoursByPlace: {
+        [agentPlanner.normalizeName("故宫")]: { open: "08:30", close: "17:00", verifyState: "verified", source: "google_places" },
+        [agentPlanner.normalizeName("景山公园")]: { open: null, close: null, verifyState: "unverified", source: "google_places" },
+      },
+    }
+  );
+  const visits = dailyPlans[0].segments.filter((s) => s.type === "visit");
+  assert.equal(visits[0].openingHours.open, "08:30");
+  assert.equal(visits[0].openingHours.close, "17:00");
+  assert.equal(visits[0].openingHours.verifyState, "verified");
+  assert.equal(visits[1].openingHours.verifyState, "unverified");
+});
+
+test("buildDailyPlansFromPlanData leaves openingHours null without the map (backward compatible)", () => {
+  const dailyPlans = agentPlanner.buildDailyPlansFromPlanData(
+    [{ day: 1, items: [{ type: "visit", title: "故宫", durationMin: 120 }] }],
+    { mode: "none" },
+    1
+  );
+  const visit = dailyPlans[0].segments.find((s) => s.type === "visit");
+  assert.equal(visit.openingHours, null);
+});
+
 test("buildDailyPlansFromPlanData fills transit durations from lookups", () => {
   const dailyPlans = agentPlanner.buildDailyPlansFromPlanData(
     [
@@ -484,4 +522,65 @@ test("parseTransitLegs extracts walk and transit legs", () => {
   assert.equal(parsed.legs[1].line, "Öresundståg");
   assert.equal(parsed.legs[1].from, "København H");
   assert.equal(parsed.legs[1].to, "Malmö C");
+});
+
+// v1.5.2 #5：缺城市元数据不虚增跨城计数
+test("computeRouteMetrics does not count cross-city when a place lacks city metadata (#5)", () => {
+  const meta = {
+    a: { city: "北京", priority: "medium" },
+    // b 缺 city（geocode 失败且无 declaredCity）
+    b: { priority: "medium" },
+    c: { city: "北京", priority: "medium" },
+  };
+  const m = agentPlanner.computeRouteMetrics(["a", "b", "c"], meta, () => null);
+  assert.equal(m.crossCityCount, 0, "未知城市段不应计为跨城");
+  assert.ok(m.legs.every((leg) => leg.crossCity === false));
+});
+
+test("computeRouteMetrics still counts cross-city when both cities are known and differ (#5)", () => {
+  const meta = {
+    a: { city: "北京", priority: "medium" },
+    b: { city: "上海", priority: "medium" },
+  };
+  const m = agentPlanner.computeRouteMetrics(["a", "b"], meta, () => null);
+  assert.equal(m.crossCityCount, 1);
+  assert.equal(m.legs[0].crossCity, true);
+});
+
+// v1.5.2 #3/#4：交付前重打分，解释与展示同源
+test("rescoreChosenForDelivery scores the final delivered order, not the pre-cluster one (#3/#4)", () => {
+  const meta = {
+    a: { city: "北京", priority: "high" },
+    b: { city: "上海", priority: "medium" },
+    c: { city: "北京", priority: "medium" },
+  };
+  const getTravel = () => null;
+  // 选择时的顺序（交错跨城），及其次优候选
+  const preCluster = { source: "greedy-fastest", order: ["a", "b", "c"] };
+  const chosen = agentPlanner.chooseBestOrder(
+    [preCluster, { source: "priority", order: ["a", "c", "b"] }],
+    meta,
+    getTravel,
+    "fastest"
+  );
+  // 交付顺序 = 聚类后（同城相邻）
+  const finalOrder = agentPlanner.clusterOrderByCity(["a", "b", "c"], meta);
+  assert.deepEqual(finalOrder, ["a", "c", "b"]);
+
+  const delivered = agentPlanner.rescoreChosenForDelivery(
+    finalOrder,
+    chosen,
+    meta,
+    getTravel,
+    "fastest"
+  );
+  // chosenBreakdown/metrics 必须与「按 finalOrder 直接算」的 routeMetrics 同源一致
+  const finalMetrics = agentPlanner.computeRouteMetrics(finalOrder, meta, getTravel);
+  assert.deepEqual(delivered.order, finalOrder);
+  assert.equal(delivered.metrics.crossCityCount, finalMetrics.crossCityCount);
+  const expectedScore = agentPlanner.scoreRouteDetailed(finalMetrics, "fastest").score;
+  assert.ok(Math.abs(delivered.cost - expectedScore) < 1e-9);
+  // 解释详情消费 delivered 后，chosenScore 与展示得分一致
+  const detail = agentPlanner.buildStrategyExplanationDetail("fastest", delivered);
+  assert.ok(Math.abs(detail.chosenScore - expectedScore) < 1e-9);
 });

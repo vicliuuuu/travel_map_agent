@@ -93,8 +93,29 @@ test("mergeDay removes an empty day and preserves places", () => {
   assert.deepEqual(result.planData[0].items.map((i) => i.title), ["A", "B"]);
 });
 
+test("advancePlace moves the closing-risk place to the front of its day (v1.5)", () => {
+  const planData = [makeDay(1, ["A", "B", "C"])];
+  const result = repair.advancePlace(planData, { evidence: { day: 1, place: "C" } }, {});
+  assert.deepEqual(result.planData[0].items.map((i) => i.title), ["C", "A", "B"]);
+  assert.deepEqual(result.changeLog.moved, ["C"]);
+  // 纯函数：不修改原始数据
+  assert.deepEqual(planData[0].items.map((i) => i.title), ["A", "B", "C"]);
+});
+
+test("advancePlace is a no-op when the place is already first", () => {
+  const planData = [makeDay(1, ["A", "B"])];
+  const result = repair.advancePlace(planData, { evidence: { day: 1, place: "A" } }, {});
+  assert.equal(result.changeLog.noop, true);
+});
+
 test("applyRepair throws on unknown action (no silent failure)", () => {
   assert.throws(() => repair.applyRepair([], "no_such_action", {}, {}), /未知修复动作/);
+});
+
+test("chooseRepairAction routes OPENING_RISK to advance_place (v1.5)", () => {
+  const opening = { code: verifier.CODES.OPENING_RISK, evidence: { day: 1, place: "B" } };
+  const chosen = repair.chooseRepairAction([opening], {});
+  assert.equal(chosen.action, "advance_place");
 });
 
 test("chooseRepairAction routes codes to actions by severity", () => {

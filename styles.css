@@ -523,6 +523,16 @@ button[disabled] {
   color: #64748b;
 }
 
+.station-hours {
+  color: #0f766e;
+  font-weight: 600;
+}
+
+.station-hours-missing {
+  color: #94a3b8;
+  font-weight: 400;
+}
+
 .station-transit {
   margin: 4px 0 4px 12px;
   padding-left: 8px;

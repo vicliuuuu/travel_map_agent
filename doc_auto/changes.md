@@ -377,3 +377,81 @@
 - 测试：新增 `tests/scoring.test.js`（7 例）；扩展 `tests/agent-planner.test.js`（候选剪枝/聚类分天/按日口径/解释/对比）与 `tests/repair.test.js`（策略联动）；`package.json` test 脚本纳入 `scoring.test.js`；全量 `node --test` 通过（**87/87**）。手工 smoke：服务正常启动、`/api/strategies` 200。
 
 修改时间：2026-08-10 17:20 (UTC+8)
+
+## 2026-08-11（内测 v1.5：工具层扩展 + 校验层扩展）
+
+在 v1.4 策略引擎/状态机基础上落地 v1.5「可插拔多事实源 + 校验层扩展」P0+P1+P2。对外接口（`POST /api/agent/plan`、`/api/agent/plan/stream`）保持兼容，新增字段均为**增量**；新工具默认关闭，未启用时输出与 v1.4 等价（doc §1「默认下等价」）。
+
+- **可插拔工具层**（新增 `tools.js`，doc §3.1/§8.1/§8.3）：统一 `Tool` 抽象 `{ name, schema, invoke, cacheKey, normalizeError, timeoutMs, retries, enabled, degradeMode }` + `createToolRegistry`（`register/get/isEnabled/listEnabled/invoke/getStats`）。`invoke` 统一做**幂等缓存**（`cacheKey` 对 args 归一化：trim/小写/去音符/键名排序）、**超时/重试**、**错误码标准化**（`RATE_LIMIT/NOT_FOUND/TIMEOUT/PROVIDER_ERROR/DISABLED/INVALID_ARGS`）、**降级**与**来源标注**，返回结构化结果（不抛出，除 fatal 降级）。
+- **降级分级**（doc §8.3）：`skip`（跳过并标注 `unverified`，如天气）/ `conservative`（保守估计，如拥堵系数 1.0）/ `fatal`（致命失败向上抛出，如 geocode 全失败）。降级不静默：`emit tool_degrade` + `logger.warn`（遵循「无静默失败」）。
+- **外部事实来源标注**（doc §2.2.3/§4）：`stampFactSource` 为每条外部事实盖上 `source/fetchedAt/verifyState`；注册表命中即 `emit fact_source`，未核实项在前端「风险校验」区块显式标注「（未核实）」。
+- **新增外部事实工具**（doc §2.1.2/§2.2）：`opening_hours`（营业时间，P0，附 `google_places` provider：Find Place → Place Details 解析当日 `[open,close]`）、`weather`（P1，provider 待接入）、`congestion`（P1，`conservative` 降级取 factor=1.0）。三者默认关闭，开关 `OPENING_HOURS_ENABLED/WEATHER_ENABLED/CONGESTION_ENABLED`；开启但无 provider 时降级标注 unverified，主流程不中断。
+- **校验层扩展**（`verifier.js`，doc §2.1.3/§3.2）：新增 `OPENING_RISK`（时间轴推算 `computeArrivalTimeline`：由当日 09:00 基准起累加游览+通勤得预计到达，晚于闭馆判 error / 数据未核实降级 warn / 剩余不足游览判 warn）、`PHYSICAL_OVERLOAD`（单日游览时长或景点数超阈值 → warn）、`HOTEL_RETURN_COST`（单日回酒店往返占比 > 阈值 → warn）。三者均**按需激活**（未传 `checks` 时不产生任何 finding，保证向后兼容）。
+- **修复联动**（`repair.js`）：新增 `advance_place`（把闭馆风险景点在其所在日内前移到首位）；`ROUTER_PRIORITY` 将 `OPENING_RISK` 置于超载之后，`routeCodeToAction` 映射到 `advance_place`。体力/往返为 warn 级不触发修复（不阻断收敛）。
+- **埋点扩展**（`tracer.js` schema `1.4.0 → 1.5.0`）：新增 `fact_source`（source/fetchedAt/verifyState）与 `tool_degrade`（tool/reason/fallbackUsed）；`tool_call` 复用统一通道承载新工具 provider/cacheHit/degraded；`validation` 承载新增三类 code。
+- **状态机接线**（`server.js`）：`plan_initial` 末尾构建工具注册表并按当前顺序拉取营业时间 → `context.openingHoursByPlace` + `context.v15Checks`（含体力/往返开关）；`verify` 将 `checks` 透传 `runVerifiers`。默认三工具关闭 → openingHoursByPlace 为空 → `OPENING_RISK` 不激活 → 与 v1.4 等价。
+- **前端**（`app.js`）：「行程校验」区块新增「风险校验（v1.5）」列表，从 `validation.findings` 过滤展示闭馆/体力/往返，标注 `·必看/·提醒` 与「（未核实）」。
+- **工程决策**：存量 `geocode_place`/`get_travel_time` 自带 `toolContext` 缓存且为核心 LLM 工具环，本版本保持原生实现不改路（`native`，避免改动无 CI 覆盖的实时环路），统一抽象先落地到新增外部事实工具；后续版本可平滑迁移。
+- 测试：新增 `tests/tools.test.js`（缓存/错误码/三级降级/超时/埋点/内置工具启用共 13 例）；扩展 `tests/verifier.test.js`（时间轴/闭馆 error+unverified warn/体力/往返 + 向后兼容 8 例）与 `tests/repair.test.js`（advance_place + 路由 3 例）；`package.json` test 脚本纳入 `tools.test.js`、版本升至 `1.5.0`；全量 `node --test` 通过（**109/109**）。手工 smoke：服务正常启动、`/api/strategies` 200。
+
+修改时间：2026-08-11 10:50 (UTC+8)
+
+## 2026-08-11（内测 v1.5.1：工具真接入 + 高危 bug 修复 + 体力偏好可选）
+
+在 v1.5.0（骨架 + 校验层）基础上，把工具从"默认关闭/空壳"改为"默认开启/真接入"，并修复了 3 个开启后会导致结论错误的高危 bug。对外接口保持兼容，请求体新增可选字段 `physicalPreference`。
+
+- **工具默认开启 + 去除"假开关"**：`OPENING_HOURS_ENABLED/WEATHER_ENABLED/CONGESTION_ENABLED` 默认改为 `true`。原 `weather/congestion` 传 `fetch:null` 导致"开关设 true 也永远启用不了"的问题已修复——三工具均接入真 provider。
+- **接入 Google Weather API**（`buildGoogleWeatherProvider`）：按经纬度取每日预报，抽取降水概率/高低温风险，产出可读提示并**并入 `precautions`**（注意事项）；地区不覆盖/无权限/解析失败时经注册表降级标注 unverified、不进注意事项。`fetchWeatherNotes` 按天（每天首景点坐标 + 实际日期）查询、命中缓存。
+- **接入拥堵（内置高峰启发式）**（`tools.peakHourCongestionFactor`）：早高峰 07:00-09:30 / 晚高峰 17:00-19:30 → ×1.4，肩部时段 → ×1.15，其余 ×1.0；无需额外 API，`congestion` 工具默认启用（也支持后续注入 Directions 实时路况 provider）。拥堵修正在 `computeArrivalTimeline` 按出发时刻放大通勤时长，直接作用于闭馆风险判定。
+- **高危 bug 修复**：
+  1. **通勤缺失按 0 算 → 到达时刻低估、闭馆漏报**：`computeArrivalTimeline` 对缺失/为 0 的 transit 段改用保守兜底 `DEFAULT_TRANSIT_FALLBACK_MIN=30`（与 `evaluateTimeFeasibility` 口径一致）。
+  2. **营业时间/天气按"今天"查而非实际游玩日期**：新增 `buildPlaceDateMap`（景点→实际日期，来自 `checkInDate`+天序），`fetchOpeningHoursForOrder`/`fetchWeatherNotes` 均按当天日期查询。
+  3. **假开关**：见上，三工具真接入。
+- **体力强度做成用户可选**（`verifier.PHYSICAL_PRESETS` + `getPhysicalPreset`）：请求体新增 `physicalPreference: easy|standard|hardcore`（默认 standard），映射到单日游览时长/景点数阈值（5h/4、7h/6、9h/8）；前端新增「体力强度偏好」下拉（`index.html`/`app.js`）。回酒店往返维持标准档（35%，`HOTEL_RETURN_MAX_RATIO` 可配）。
+- 测试：`tests/tools.test.js` 增高峰启发式 + 拥堵工具默认启用（+3）；`tests/verifier.test.js` 增通勤兜底 + 拥堵修正 + 体力档位映射（+3，共 +5）；全量 `node --test` 通过（**114/114**）。手工 smoke：默认开启工具下服务正常启动、`/api/strategies` 200。
+- **待用户实测**：`opening_hours`/`weather` 依赖真实 Google API 响应，其解析（跨天/24h/午休营业、Weather 覆盖区域）需用户开通 Places API + Weather API 后跑真实行程验证。
+
+修改时间：2026-08-11 11:45 (UTC+8)
+
+## 2026-08-11（内测 v1.5.2：全链路审计与修复 —— 性能 + 正确性 + 一致性）
+
+对 v1.3/v1.4 迭代与整条 pipeline（输入 → LLM 工具环 → 打分/聚类 → 分天 → 校验 → 修复 → 组装）做了一轮系统审计。未发现会崩溃的致命 bug，修复了以下 5 项真问题（含 2 项对用户可感知的功能缺陷）：
+
+- **#1 外部工具串行 → 并发化 + 超时放宽 + 可选收窄范围（性能/成本）**：工具默认开启后，`opening_hours`（每景点 findplace+details 两跳）与 `weather`（每天一次）此前**串行 `await`**，N 景点/M 天 ≈ 2N+M 次串行外部调用，延迟/费用/限流风险大。
+  - 新增有界并发映射 `mapWithConcurrency`（保序、不吞异常），`fetchOpeningHoursForOrder`/`fetchWeatherNotes` 改并发，`TOOL_FETCH_CONCURRENCY`（默认 5）可调。
+  - `opening_hours` 单次 invoke 含两跳，原 4s 超时偏紧易误判降级，放宽至 9s（`OPENING_HOURS_TIMEOUT_MS`）；`weather` 6s（`WEATHER_TIMEOUT_MS`）。
+  - 新增 `OPENING_HOURS_SCOPE=all|high`（默认 all）：设 `high` 仅查高优先级景点，省调用/省钱（全非高优时回退全量，避免闭馆校验完全失明）。
+- **#2 用户「每个景点游玩时长」被忽略 → 兜底生效（功能缺陷）**：前端 `visitMinutes` 一直发送但后端从不消费，时长只来自 LLM 建议或硬编码 90，导致该控件"看似可调、实则无效"。
+  - `normalizeTripInput` 解析 `visitMinutes`（clamp 30~480）；新增 `applyDefaultVisitDuration` 仅对**无显式时长**的景点回填（不覆盖 LLM 更精确建议），向下游 planData/分天/体力校验一致传导。
+- **#3/#4 策略解释与展示指标不同源 → 交付前重打分（一致性）**：`clusterOrderByCity`（OI-1）与修复阶段会改变最终顺序，而结构化解释仍用"选择时"的 `chosenRoute`，多城市/发生修复时"解释的得分构成 ≠ 页面 routeMetrics"。
+  - 新增 `agentPlanner.rescoreChosenForDelivery`：以最终交付顺序重算得分构成，并用同一 lookup 对次优候选重打分，使 `strategyExplanation.chosenScore/scoreGap` 与展示同源一致。
+- **#5 缺城市元数据虚增跨城计数**：`computeRouteMetrics` 原以 `prevCity !== city` 判跨城，某点无城市元数据（geocode 失败且无 declaredCity）时会被误判为跨城。改为"仅当相邻两点城市均已知且不同"才计跨城，`legs[].crossCity` 同口径。
+- 测试：`tests/agent-planner.test.js` 增 `rescoreChosenForDelivery` 与缺城市跨城口径（+3）；`tests/day-plan.test.js` 增 `applyDefaultVisitDuration` 与 `mapWithConcurrency`（保序/限流/不吞异常，+4）；全量 `node --test` 通过（**121/121**）。
+- 已知遗留（未在本版处理，风险低）：LLM 工具环超轮次直接 500（缺保底）、`buildDailyPlansFromRoadbook` 为死代码（仍用 `index % dayCount` 老轮询，主流程已不用）、第二方案不做 v1.5 校验。
+
+修改时间：2026-08-11 12:10 (UTC+8)
+
+## 2026-08-11（内测 v1.5.3：外部事实"可见化"+ opening_hours 命中率修复）
+
+针对"结果里看不出用了 Places/Weather API"的反馈，修复了 opening_hours 全 NOT_FOUND 的根因，并把两类外部事实显式透出到结果页。
+
+- **修复 opening_hours 全 NOT_FOUND（根因）**：原 `findplacefromtext` 仅用原始名查询（如"市政厅""利姆港"等中文泛称、无上下文）→ Google 返回 `ZERO_RESULTS`。改为：① 查询词 = `景点名 + 已解析城市 + 国家` 消歧，`locationbias` 由 `point` 改 `circle:5000m`；② 首次未命中时用地理编码规范地址（`formattedAddress`）二次兜底；③ 非 `ZERO_RESULTS` 的真错误（REQUEST_DENIED/OVER_QUERY_LIMIT）按 `PROVIDER_ERROR` 上抛降级，不吞。
+- **营业时间透出到每个景点（#1，自证 Places API）**：`buildDailyPlansFromPlanData` 新增 `options.openingHoursByPlace`，把 `{open, close, verifyState, source}` 挂到每个 visit 段；三处调用（verify / assembleResult 兜底 / 第二方案）均透传。前端 `renderOpeningHours` 在每个"站"下展示「营业：HH:MM–HH:MM · 来源 Google Places」（已核实，青色加粗）或「营业时间：未获取（未核实）」（灰字）；纯文本导出同步。新增 `styles.css` 的 `.station-hours/.station-hours-missing`。
+- **天气无风险也显示（#2）**：`fetchWeatherNotes` 原仅在有风险时进注意事项，好天气什么都不显示。改为只要有 `summary` 就展示当天天气（"第X天（日期）·城市：多云，最高28℃，降水10%。"），有风险追加"，注意X"。
+- 测试：`tests/agent-planner.test.js` 增营业时间透出 + 无 map 向后兼容（+2）；全量 `node --test` 通过（**123/123**）。
+- **注意**：需重启 `node server.js` 使 provider 改动生效；opening_hours 命中仍依赖 Places API 权限与该景点在 Google 有 POI 记录（纯地名/行政区无营业时间属正常 NOT_FOUND）。
+
+修改时间：2026-08-11 13:15 (UTC+8)
+
+## 2026-08-11（内测 v1.5.4：天气默认关闭 + 日期门控）
+
+反馈：当前流程未采集"实际出行日期"，Weather API 只能取"最近一天"的预报，对几个月后的行程无意义（鸡肋）。
+
+- **天气默认关闭**：`WEATHER_ENABLED` 默认由 `true` 改为 `false`（需显式设 `true` 才启用）。
+- **日期门控（即使启用也更扎实）**：`fetchWeatherNotes` 仅对"有实际日期（由入住日期推导）"的天查询；未填入住日期时整体跳过，不再查无意义的"今天天气"。
+- 文档：README 环境变量表更新 `WEATHER_ENABLED` 默认值与说明。
+- 全量 `node --test` 通过（**123/123**，无用例依赖天气默认值）。
+
+> 后续若增加"出行日期/日期区间"输入，可将默认改回开启，届时日期门控天然生效。
+
+修改时间：2026-08-11 13:20 (UTC+8)
