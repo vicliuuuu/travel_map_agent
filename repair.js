@@ -231,11 +231,59 @@ function mergeDay(planData, failure, context) {
   };
 }
 
+// advance_place（提前顺序）：把闭馆风险景点在其所在日内前移到首位，争取在闭馆前到达（doc §3.2 OPENING_RISK 建议动作）。
+function advancePlace(planData, failure, context) {
+  var plan = clonePlan(planData);
+  var evidence = (failure && failure.evidence) || {};
+  var targetName = evidence.place;
+  var idx = findDayIndexByNumber(plan, evidence.day);
+  if (idx < 0 || !targetName) {
+    return {
+      planData: plan,
+      changeLog: { action: "advance_place", note: "无法定位闭馆风险景点，跳过", noop: true },
+    };
+  }
+  var dayPlan = plan[idx];
+  var items = Array.isArray(dayPlan.items) ? dayPlan.items.slice() : [];
+  var before = visitItems(dayPlan).map(function (item) { return item.title; });
+  var targetKey = normalizeName(targetName);
+  var moved = null;
+  var rest = [];
+  items.forEach(function (item) {
+    if (item && item.type === "visit" && normalizeName(item.title) === targetKey && !moved) {
+      moved = item;
+      return;
+    }
+    rest.push(item);
+  });
+  if (!moved) {
+    return {
+      planData: plan,
+      changeLog: { action: "advance_place", dayAffected: dayPlan.day, note: "该日未找到目标景点，跳过", noop: true },
+    };
+  }
+  dayPlan.items = [moved].concat(rest);
+  var after = visitItems(dayPlan).map(function (item) { return item.title; });
+  return {
+    planData: plan,
+    changeLog: {
+      action: "advance_place",
+      dayAffected: dayPlan.day,
+      moved: [targetName],
+      before: before,
+      after: after,
+      note: "第 " + dayPlan.day + " 天将闭馆风险景点「" + targetName + "」提前到当日首位",
+      noop: before.join("|") === after.join("|"),
+    },
+  };
+}
+
 var REPAIR_ACTIONS = {
   split_day: splitDay,
   drop_lowest_priority: dropLowestPriority,
   swap_neighbor: swapNeighbor,
   merge_day: mergeDay,
+  advance_place: advancePlace,
 };
 
 function applyRepair(planData, actionName, failure, context) {
@@ -251,6 +299,7 @@ function applyRepair(planData, actionName, failure, context) {
 // 优先级顺序（严重度从高到低）：超载 > 闭环断裂 > 跨城冲突 > 空天过多。
 var ROUTER_PRIORITY = [
   CODES.TIME_OVERLOAD,
+  CODES.OPENING_RISK,
   CODES.HOTEL_LOOP_BROKEN,
   CODES.CROSS_CITY_CONFLICT,
   CODES.TOO_MANY_EMPTY_DAYS,
@@ -266,6 +315,10 @@ function routeCodeToAction(code, failure, context) {
       return "drop_lowest_priority";
     }
     return "split_day";
+  }
+  if (code === CODES.OPENING_RISK) {
+    // 闭馆风险：优先「提前该点顺序」；若该景点已在首位则退化为按城市换序。
+    return "advance_place";
   }
   if (code === CODES.HOTEL_LOOP_BROKEN) {
     return "merge_day";
@@ -360,6 +413,7 @@ module.exports = {
   dropLowestPriority: dropLowestPriority,
   swapNeighbor: swapNeighbor,
   mergeDay: mergeDay,
+  advancePlace: advancePlace,
   applyRepair: applyRepair,
   chooseRepairAction: chooseRepairAction,
   routeCodeToAction: routeCodeToAction,

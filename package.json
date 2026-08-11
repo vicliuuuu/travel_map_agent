@@ -1,11 +1,11 @@
 {
   "name": "travel-map-agent",
-  "version": "1.4.0",
-  "description": "旅行规划 Agent：地图标点 + LLM/Google Maps 工具智能路书（内测 v1.4 策略引擎：多策略打分 + 候选剪枝 + OI-1 分天根治）",
+  "version": "1.5.4",
+  "description": "旅行规划 Agent：地图标点 + LLM/Google Maps 工具智能路书（内测 v1.5 工具层扩展：可插拔多事实源[营业时间/天气/拥堵] + 校验层扩展：闭馆/体力/回酒店往返）",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test tests/planner.test.js tests/llm.test.js tests/agent-planner.test.js tests/location-data.test.js tests/verifier.test.js tests/repair.test.js tests/state-machine.test.js tests/tracer.test.js tests/day-plan.test.js tests/scoring.test.js"
+    "test": "node --test tests/planner.test.js tests/llm.test.js tests/agent-planner.test.js tests/location-data.test.js tests/verifier.test.js tests/repair.test.js tests/state-machine.test.js tests/tracer.test.js tests/day-plan.test.js tests/scoring.test.js tests/tools.test.js"
   },
   "engines": {
     "node": ">=18"

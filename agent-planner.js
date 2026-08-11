@@ -289,6 +289,8 @@ function buildDailyPlansFromPlanData(planData, lodging, totalDays, options) {
     : "";
   var checkInDate = checkInDateText ? new Date(checkInDateText + "T00:00:00Z") : null;
   var opts = options || {};
+  // v1.5.2 #1：把营业时间（Google Places）透出到每个景点，供前端展示与自证数据来源。
+  var openingHoursByPlace = opts.openingHoursByPlace || null;
 
   return safePlan.map(function (dayPlan, index) {
     var items = (Array.isArray(dayPlan.items) ? dayPlan.items : []).filter(function (item) {
@@ -300,11 +302,15 @@ function buildDailyPlansFromPlanData(planData, lodging, totalDays, options) {
       if (itemIndex === 0 && hasHotel) {
         segments.push(buildTransitSegment(hotelName, item.title, opts));
       }
+      var oh = openingHoursByPlace ? (openingHoursByPlace[normalizeName(item.title)] || null) : null;
       segments.push({
         type: "visit",
         placeName: item.title,
         visitTimeRange: item.durationMin ? ("建议" + (Math.max(0.5, Number(item.durationMin) / 60).toFixed(1)) + "小时") : "",
         visitDurationMin: Number(item.durationMin) || 90,
+        openingHours: oh
+          ? { open: oh.open || null, close: oh.close || null, verifyState: oh.verifyState || "verified", source: oh.source || null }
+          : null,
       });
       var nextItem = items[itemIndex + 1];
       if (nextItem) {
@@ -444,11 +450,13 @@ function computeRouteMetrics(order, placeMetaMap, getTravelMin) {
       if (travelMin === null) {
         travelMin = sameCity ? 30 : 120;
       }
-      if (prevCity !== city) {
+      // #5：仅当相邻两点城市均已知且不同才计跨城，避免「缺城市元数据」被误判为跨城而虚增计数。
+      var isCrossCity = Boolean(prevCity) && Boolean(city) && prevCity !== city;
+      if (isCrossCity) {
         crossCityCount += 1;
       }
       totalTravelMin += travelMin;
-      legs.push({ from: prev, to: name, durationMin: travelMin, crossCity: prevCity !== city });
+      legs.push({ from: prev, to: name, durationMin: travelMin, crossCity: isCrossCity });
     }
   }
 
@@ -790,6 +798,40 @@ function buildStrategyExplanationDetail(strategy, chosenRoute) {
   };
 }
 
+// v1.5.2（#3/#4）交付前重打分：clusterOrderByCity（OI-1）与修复阶段会改变最终顺序，
+// 若结构化解释仍用「选择时」的 chosenRoute，会出现「解释的得分构成 ≠ 页面展示的 routeMetrics」。
+// 本函数以 finalOrder（= 展示口径）重算得分构成，并用同一 lookup 对次优候选顺序重打分，
+// 使 buildStrategyExplanationDetail 的 chosenBreakdown/scoreGap 与展示同源、口径一致。
+function rescoreChosenForDelivery(finalOrder, chosenRoute, placeMetaMap, getTravelMin, strategy, transportPreference) {
+  var order = (Array.isArray(finalOrder) ? finalOrder : []).filter(Boolean);
+  var metrics = computeRouteMetrics(order, placeMetaMap, getTravelMin);
+  var detail = scoreRouteDetailed(metrics, strategy, transportPreference);
+  var prev = chosenRoute || {};
+  var second = null;
+  var prevSecond = prev.secondBest || null;
+  if (prevSecond && Array.isArray(prevSecond.order) && prevSecond.order.length) {
+    var secMetrics = computeRouteMetrics(prevSecond.order, placeMetaMap, getTravelMin);
+    var secDetail = scoreRouteDetailed(secMetrics, strategy, transportPreference);
+    second = {
+      source: prevSecond.source || null,
+      order: prevSecond.order.slice(),
+      metrics: secMetrics,
+      cost: secDetail.score,
+      breakdown: secDetail.breakdown,
+      normalized: secDetail.normalized,
+    };
+  }
+  return {
+    source: prev.source || "llm",
+    order: order,
+    metrics: metrics,
+    cost: detail.score,
+    breakdown: detail.breakdown,
+    normalized: detail.normalized,
+    secondBest: second,
+  };
+}
+
 // v1.4 A/B 多方案对比：主方案 = 用户所选策略；对比方案 = 「次优策略」，
 // 定义为在同一候选集上、其最优顺序与主方案不同、且与主方案对比度最高的其他策略。
 // 对比度 = |跨城差| + |总通勤差|/60，deterministic 便于回归。
@@ -1013,6 +1055,7 @@ module.exports = {
   orderSignature: orderSignature,
   buildStrategyExplanation: buildStrategyExplanation,
   buildStrategyExplanationDetail: buildStrategyExplanationDetail,
+  rescoreChosenForDelivery: rescoreChosenForDelivery,
   compareStrategies: compareStrategies,
   parseTransitLegs: parseTransitLegs,
 };

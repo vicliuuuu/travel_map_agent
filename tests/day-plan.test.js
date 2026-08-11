@@ -75,3 +75,61 @@ test("gap == 1 (needs one fewer day): dual plans, plan A keeps all places over u
   assert.equal(result.secondary.days, 1);
   assert.deepEqual(result.secondary.order, ["A", "B", "C"]);
 });
+
+// v1.5.2 #2：用户级 visitMinutes 兜底
+test("applyDefaultVisitDuration fills only places without explicit duration (#2)", () => {
+  const list = [
+    { name: "有LLM时长", suggestedDurationMin: 200 },
+    { name: "既有durationMin", durationMin: 45 },
+    { name: "缺时长" },
+    { name: "非法时长", suggestedDurationMin: 0 },
+  ];
+  server.applyDefaultVisitDuration(list, 120);
+  assert.equal(list[0].suggestedDurationMin, 200);
+  assert.equal(list[0].durationMin, undefined); // 未覆盖已有 LLM 建议
+  assert.equal(list[1].durationMin, 45);
+  assert.equal(list[2].durationMin, 120); // 回填
+  assert.equal(list[3].durationMin, 120); // 非法(0)视为缺失，回填
+});
+
+test("applyDefaultVisitDuration clamps to [30,480] and no-ops on invalid fallback (#2)", () => {
+  const tooBig = [{ name: "x" }];
+  server.applyDefaultVisitDuration(tooBig, 9999);
+  assert.equal(tooBig[0].durationMin, 480);
+
+  const tooSmall = [{ name: "x" }];
+  server.applyDefaultVisitDuration(tooSmall, 5);
+  assert.equal(tooSmall[0].durationMin, 30);
+
+  const untouched = [{ name: "x" }];
+  server.applyDefaultVisitDuration(untouched, null);
+  assert.equal(untouched[0].durationMin, undefined);
+});
+
+// v1.5.2 #1：有界并发映射保序 + 不吞异常
+test("mapWithConcurrency preserves order and caps in-flight count (#1)", async () => {
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const items = [10, 40, 20, 5, 30, 15];
+  const out = await server.mapWithConcurrency(items, 2, async (n) => {
+    inFlight += 1;
+    maxInFlight = Math.max(maxInFlight, inFlight);
+    await new Promise((r) => setTimeout(r, n));
+    inFlight -= 1;
+    return n * 2;
+  });
+  assert.deepEqual(out, [20, 80, 40, 10, 60, 30]); // 保序
+  assert.ok(maxInFlight <= 2, "并发不超过 limit=2，实际 " + maxInFlight);
+});
+
+test("mapWithConcurrency rethrows (no silent failure) (#1)", async () => {
+  await assert.rejects(
+    server.mapWithConcurrency([1, 2, 3], 2, async (n) => {
+      if (n === 2) {
+        throw new Error("boom");
+      }
+      return n;
+    }),
+    /boom/
+  );
+});

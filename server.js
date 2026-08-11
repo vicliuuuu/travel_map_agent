@@ -10,12 +10,28 @@ var tracer = require("./tracer.js");
 var verifier = require("./verifier.js");
 var repair = require("./repair.js");
 var stateMachine = require("./state-machine.js");
+var tools = require("./tools.js");
 
 // v1.3 收敛控制参数（可用环境变量覆盖，便于回归调参）
 var MAX_REPAIR_ROUNDS = Number(process.env.MAX_REPAIR_ROUNDS || repair.MAX_REPAIR_ROUNDS);
 var NO_IMPROVE_LIMIT = Number(process.env.NO_IMPROVE_LIMIT || repair.NO_IMPROVE_LIMIT);
 // v1.4 候选集合上限（防组合爆炸，可用环境变量覆盖便于调参）
 var CANDIDATE_LIMIT = Number(process.env.CANDIDATE_LIMIT || 20);
+// v1.5 可插拔工具开关（默认开启；opening_hours/weather 需 Google API 权限，缺失/失败时自动降级标注 unverified，不中断主流程）
+var OPENING_HOURS_ENABLED = String(process.env.OPENING_HOURS_ENABLED || "true").toLowerCase() !== "false";
+// 天气默认关闭：当前流程未采集实际出行日期，预报只能取"最近一天"，对未来行程无意义（鸡肋）。
+// 需要时设 WEATHER_ENABLED=true，且仅当填写了入住日期（据此推导每天日期）才会真正查询。
+var WEATHER_ENABLED = String(process.env.WEATHER_ENABLED || "false").toLowerCase() === "true";
+// 拥堵默认采用内置高峰时段启发式（无需额外 API），也可后续接入 Directions 实时路况 provider
+var CONGESTION_ENABLED = String(process.env.CONGESTION_ENABLED || "true").toLowerCase() !== "false";
+// v1.5.2 外部事实工具（opening_hours/weather）并发拉取上限：串行改并发以压缩延迟，同时限流防撞配额（默认 5）
+var TOOL_FETCH_CONCURRENCY = Math.max(1, Number(process.env.TOOL_FETCH_CONCURRENCY) || 5);
+// v1.5.2 营业时间查询范围：all=全部景点；high=仅高优先级景点（省调用/省钱，代价是低优景点闭馆仅靠常识兜底）。默认 all。
+var OPENING_HOURS_SCOPE = String(process.env.OPENING_HOURS_SCOPE || "all").toLowerCase() === "high" ? "high" : "all";
+// v1.5 新增校验开关与阈值（体力/往返为纯计算，默认开启且为 warn 级，不阻断收敛）
+var PHYSICAL_CHECK_ENABLED = String(process.env.PHYSICAL_CHECK_ENABLED || "true").toLowerCase() !== "false";
+var HOTEL_RETURN_CHECK_ENABLED = String(process.env.HOTEL_RETURN_CHECK_ENABLED || "true").toLowerCase() !== "false";
+var DAY_START_MIN = Number(process.env.DAY_START_MIN || verifier.DEFAULT_DAY_START_MIN);
 // 状态机可视化调试端点开关：内测默认开启，正式上线可设 ENABLE_DEBUG_TRACE=false
 var ENABLE_DEBUG_TRACE = String(process.env.ENABLE_DEBUG_TRACE || "true").toLowerCase() !== "false";
 
@@ -110,6 +126,10 @@ function createToolContext(input) {
     geocodeByKey: {},
     travelCache: {},
     geocodeEntries: [],
+    // v1.5 工具层缓存：注册表共享幂等缓存 + 外部事实结果
+    toolCache: {},
+    openingHoursByPlace: {},
+    weatherByCity: {},
   };
 }
 
@@ -215,11 +235,17 @@ function normalizeTripInput(body) {
   if (!Number.isFinite(manualDays) || manualDays <= 0) {
     manualDays = 1;
   }
+  // #2：用户级「每个景点游玩时长」，作为无显式时长景点的兜底（clamp 30~480，非法则不启用兜底）。
+  var visitMinutesRaw = Number(body.visitMinutes);
+  var visitMinutes = Number.isFinite(visitMinutesRaw) && visitMinutesRaw > 0
+    ? Math.max(30, Math.min(480, Math.floor(visitMinutesRaw)))
+    : null;
   return {
     destinations: destinations,
     places: splitResult.places,
     lodging: splitResult.lodging,
     totalDays: Math.floor(manualDays),
+    visitMinutes: visitMinutes,
     country: String(body.country || (destinations[0] && destinations[0].country) || "").trim(),
     city: String(
       body.city ||
@@ -439,6 +465,353 @@ function fetchTransitDirections(toolContext, fromName, toName, mapsApiKey) {
         reject(err);
       });
   });
+}
+
+// v1.5 opening_hours provider（doc §3.1 provider: google_places）：Find Place → Place Details 取 opening_hours。
+// 默认关闭（OPENING_HOURS_ENABLED=false），开启后需 Places API 权限；解析失败/无数据时抛出标准错误交由注册表降级。
+function buildGooglePlacesOpeningHoursProvider(mapsApiKey, toolContext) {
+  return async function fetchOpeningHours(args) {
+    var placeName = String(args && args.placeName || "").trim();
+    if (!placeName) {
+      var argErr = new Error("opening_hours 缺少 placeName");
+      argErr.code = "INVALID_ARGS";
+      throw argErr;
+    }
+    var geo = toolContext.geocodeByName[placeName.toLowerCase()] || null;
+
+    // findplacefromtext 对「中文泛称/无上下文」的输入极易 ZERO_RESULTS（如"市政厅""利姆港"）。
+    // 策略：① 名称 + 已解析城市/国家消歧 + circle locationbias；② 若仍未命中，用地理编码规范地址兜底。
+    async function findPlaceId(inputText) {
+      var text = String(inputText || "").trim();
+      if (!text) {
+        return null;
+      }
+      var url = "https://maps.googleapis.com/maps/api/place/findplacefromtext/json?input=" +
+        encodeURIComponent(text) + "&inputtype=textquery&fields=place_id" +
+        (geo ? "&locationbias=" + encodeURIComponent("circle:5000@" + geo.lat + "," + geo.lng) : "") +
+        "&key=" + encodeURIComponent(mapsApiKey);
+      var r = await fetch(url);
+      var d = await r.json();
+      if (d.status === "OK" && Array.isArray(d.candidates) && d.candidates[0]) {
+        return d.candidates[0].place_id;
+      }
+      if (d.status === "ZERO_RESULTS") {
+        return null;
+      }
+      // 非 ZERO_RESULTS（如 REQUEST_DENIED/OVER_QUERY_LIMIT）属真错误，不吞：抛给注册表按 PROVIDER_ERROR 降级。
+      var err = new Error("opening_hours findplace 失败: " + placeName + " (" + d.status + ")");
+      err.code = "PROVIDER_ERROR";
+      throw err;
+    }
+
+    var primaryQuery = [placeName, geo && geo.resolvedCity, geo && geo.resolvedCountry]
+      .filter(Boolean)
+      .join(" ");
+    var placeId = await findPlaceId(primaryQuery);
+    if (!placeId && geo && geo.formattedAddress) {
+      placeId = await findPlaceId(geo.formattedAddress);
+    }
+    if (!placeId) {
+      var notFound = new Error("opening_hours 未找到地点: " + placeName);
+      notFound.code = "NOT_FOUND";
+      throw notFound;
+    }
+    var detailUrl = "https://maps.googleapis.com/maps/api/place/details/json?place_id=" +
+      encodeURIComponent(placeId) + "&fields=opening_hours&key=" + encodeURIComponent(mapsApiKey);
+    var detailRes = await fetch(detailUrl);
+    var detailData = await detailRes.json();
+    if (detailData.status !== "OK" || !detailData.result || !detailData.result.opening_hours) {
+      var noHours = new Error("opening_hours 无营业时间数据: " + placeName);
+      noHours.code = "NOT_FOUND";
+      throw noHours;
+    }
+    // periods[].close.time 形如 "1800"；取当日日期对应星期几。若缺失则由注册表降级。
+    var date = args && args.date ? new Date(args.date + "T00:00:00Z") : new Date();
+    var weekday = date.getUTCDay();
+    var periods = Array.isArray(detailData.result.opening_hours.periods) ? detailData.result.opening_hours.periods : [];
+    var todays = periods.find(function (p) { return p && p.open && Number(p.open.day) === weekday; });
+    if (!todays || !todays.open || !todays.close) {
+      var noToday = new Error("opening_hours 当日无开放时段: " + placeName);
+      noToday.code = "NOT_FOUND";
+      throw noToday;
+    }
+    function toClock(hhmm) {
+      var s = String(hhmm || "").padStart(4, "0");
+      return s.slice(0, 2) + ":" + s.slice(2, 4);
+    }
+    return {
+      placeName: placeName,
+      open: toClock(todays.open.time),
+      close: toClock(todays.close.time),
+    };
+  };
+}
+
+// v1.5 weather provider（Google Maps Platform Weather API）：按经纬度取每日预报，抽取降水/温度风险。
+// 默认开启；地区不覆盖/无权限/解析失败时抛出标准错误，交由注册表降级标注 unverified（不进 precautions）。
+function buildGoogleWeatherProvider(mapsApiKey) {
+  return async function fetchWeather(args) {
+    var lat = Number(args && args.lat);
+    var lng = Number(args && args.lng);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+      var argErr = new Error("weather 缺少经纬度");
+      argErr.code = "INVALID_ARGS";
+      throw argErr;
+    }
+    var url = "https://weather.googleapis.com/v1/forecast/days:lookup?key=" + encodeURIComponent(mapsApiKey) +
+      "&location.latitude=" + encodeURIComponent(lat) +
+      "&location.longitude=" + encodeURIComponent(lng) + "&days=10";
+    var res = await fetch(url);
+    var data = await res.json();
+    if (!res.ok || !data || !Array.isArray(data.forecastDays) || !data.forecastDays.length) {
+      var notFound = new Error("weather 无预报数据（可能地区不覆盖）: " + JSON.stringify((data && data.error) || {}));
+      notFound.code = res.status === 403 ? "PROVIDER_ERROR" : "NOT_FOUND";
+      throw notFound;
+    }
+    function ymd(disp) {
+      if (!disp) { return ""; }
+      var mm = String(disp.month || "").padStart(2, "0");
+      var dd = String(disp.day || "").padStart(2, "0");
+      return disp.year + "-" + mm + "-" + dd;
+    }
+    var target = String(args && args.date || "");
+    var day = data.forecastDays.find(function (d) { return ymd(d.displayDate) === target; }) || data.forecastDays[0];
+    var daytime = day.daytimeForecast || {};
+    var condText = (((daytime.weatherCondition || {}).description || {}).text) || "";
+    var precipPct = Number(((daytime.precipitation || {}).probability || {}).percent);
+    var maxTempC = Number((day.maxTemperature || {}).degrees);
+    var minTempC = Number((day.minTemperature || {}).degrees);
+    var risk = "";
+    if (Number.isFinite(precipPct) && precipPct >= 60) {
+      risk = "降水概率高";
+    }
+    if (Number.isFinite(maxTempC) && maxTempC >= 35) {
+      risk = risk ? (risk + "、高温") : "高温";
+    }
+    if (Number.isFinite(minTempC) && minTempC <= -5) {
+      risk = risk ? (risk + "、严寒") : "严寒";
+    }
+    var parts = [];
+    if (condText) { parts.push(condText); }
+    if (Number.isFinite(maxTempC)) { parts.push("最高约 " + Math.round(maxTempC) + "℃"); }
+    if (Number.isFinite(precipPct)) { parts.push("降水概率 " + Math.round(precipPct) + "%"); }
+    return {
+      date: target,
+      condition: condText,
+      maxTempC: Number.isFinite(maxTempC) ? Math.round(maxTempC) : null,
+      precipPct: Number.isFinite(precipPct) ? Math.round(precipPct) : null,
+      risk: risk,
+      summary: parts.join("，"),
+    };
+  };
+}
+
+// v1.5 构建工具注册表：注册可插拔外部事实工具（opening_hours/weather/congestion），默认全部启用。
+// opening_hours/weather 走 Google API（失败自动降级）；congestion 默认走内置高峰启发式（无需额外 API）。
+// tracer 注入后自动埋点 tool_call/fact_source/tool_degrade。
+function buildToolRegistry(toolContext, tracerRef, mapsApiKey) {
+  var registry = tools.createToolRegistry({
+    tracer: tracerRef || null,
+    cache: toolContext.toolCache,
+  });
+  registry.register(tools.buildOpeningHoursTool({
+    enabled: OPENING_HOURS_ENABLED && Boolean(mapsApiKey),
+    source: "google_places",
+    // opening_hours 单次 invoke 内含 findplace + details 两跳，4s 对两跳偏紧易误判超时降级，放宽到 9s。
+    timeoutMs: Number(process.env.OPENING_HOURS_TIMEOUT_MS) || 9000,
+    fetch: buildGooglePlacesOpeningHoursProvider(mapsApiKey, toolContext),
+  }));
+  registry.register(tools.buildWeatherTool({
+    enabled: WEATHER_ENABLED && Boolean(mapsApiKey),
+    source: "google_weather",
+    timeoutMs: Number(process.env.WEATHER_TIMEOUT_MS) || 6000,
+    fetch: buildGoogleWeatherProvider(mapsApiKey),
+  }));
+  registry.register(tools.buildCongestionTool({
+    enabled: CONGESTION_ENABLED,
+    source: "peak_hour_heuristic",
+    // 不传 fetch：使用内置高峰时段启发式（拥堵修正在到达时刻推算中直接应用，见 v15Checks.congestion）
+  }));
+  return registry;
+}
+
+// v1.5 景点 → 实际游玩日期映射（供 opening_hours/weather 按当天查询，修复"按今天查"的问题）。
+// 有界并发映射：保序返回 fn(item, index) 的结果，最多同时 limit 个在飞（压延迟 + 限流防撞配额）。
+// fn 抛出的异常不吞：直接拒绝整个 Promise，交由调用方处理（遵循「无静默失败」）。
+async function mapWithConcurrency(items, limit, fn) {
+  var list = Array.isArray(items) ? items : [];
+  var max = Math.max(1, Number(limit) || 1);
+  var results = new Array(list.length);
+  var cursor = 0;
+  async function worker() {
+    while (true) {
+      var index = cursor;
+      cursor += 1;
+      if (index >= list.length) {
+        return;
+      }
+      results[index] = await fn(list[index], index);
+    }
+  }
+  var workers = [];
+  var w;
+  for (w = 0; w < Math.min(max, list.length); w += 1) {
+    workers.push(worker());
+  }
+  await Promise.all(workers);
+  return results;
+}
+
+// #2 修复：用户级「每个景点游玩时长」(visitMinutes) 作为缺省时长兜底生效。
+// 仅对没有显式时长（LLM suggestedDurationMin / 既有 durationMin）的景点回填，避免覆盖模型给出的更精确建议。
+function applyDefaultVisitDuration(places, fallbackMinutes) {
+  var fallback = Number(fallbackMinutes);
+  if (!Number.isFinite(fallback) || fallback <= 0) {
+    return;
+  }
+  (Array.isArray(places) ? places : []).forEach(function (place) {
+    if (!place) {
+      return;
+    }
+    var explicit = Number(place.suggestedDurationMin || place.durationMin);
+    if (!Number.isFinite(explicit) || explicit <= 0) {
+      place.durationMin = Math.max(30, Math.min(480, Math.floor(fallback)));
+    }
+  });
+}
+
+function buildPlaceDateMap(planData, lodging) {
+  var map = {};
+  var checkInText = lodging && lodging.hotel && lodging.hotel.checkInDate
+    ? String(lodging.hotel.checkInDate).trim()
+    : "";
+  var checkIn = checkInText ? new Date(checkInText + "T00:00:00Z") : null;
+  (Array.isArray(planData) ? planData : []).forEach(function (dayPlan, index) {
+    var date = "";
+    if (checkIn && !Number.isNaN(checkIn.getTime())) {
+      date = new Date(checkIn.getTime() + index * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    }
+    (Array.isArray(dayPlan.items) ? dayPlan.items : []).forEach(function (item) {
+      if (item && item.type === "visit" && item.title) {
+        map[agentPlanner.normalizeName(item.title)] = { date: date, day: Number(dayPlan.day) || (index + 1) };
+      }
+    });
+  });
+  return map;
+}
+
+// v1.5 按天拉取天气，产出可读的注意事项（接入 precautions）。每个（城市/首景点, 日期）一次，命中缓存。
+async function fetchWeatherNotes(planData, placeDateMap, registry, toolContext, onProgress, concurrency) {
+  if (!registry || !registry.isEnabled("weather")) {
+    return [];
+  }
+  var plan = Array.isArray(planData) ? planData : [];
+  // 每天取首个可定位景点作为查询锚点，跳过空天或无地理编码的天。
+  var targets = [];
+  plan.forEach(function (dayPlan, i) {
+    var visits = (Array.isArray(dayPlan.items) ? dayPlan.items : []).filter(function (it) {
+      return it && it.type === "visit" && it.title;
+    });
+    if (!visits.length) {
+      return;
+    }
+    var firstName = visits[0].title;
+    var geo = toolContext.geocodeByName[String(firstName).trim().toLowerCase()];
+    if (!geo) {
+      return;
+    }
+    var meta = placeDateMap[agentPlanner.normalizeName(firstName)] || {};
+    // 无实际出行日期（未填入住日期）时，天气预报只会取"最近一天"，对未来行程无意义 → 跳过，避免误导。
+    if (!meta.date) {
+      return;
+    }
+    targets.push({ dayLabel: dayPlan.day || i + 1, firstName: firstName, geo: geo, date: meta.date });
+  });
+
+  var total = targets.length;
+  var done = 0;
+  // 并发拉取（保序），压缩「按天串行」带来的累计延迟。
+  var results = await mapWithConcurrency(targets, concurrency, async function (t) {
+    var res = await registry.invoke("weather", {
+      placeName: t.firstName,
+      city: t.geo.resolvedCity || "",
+      date: t.date,
+      lat: t.geo.lat,
+      lng: t.geo.lng,
+    });
+    done += 1;
+    if (typeof onProgress === "function") {
+      onProgress({ stage: "weather", message: "查询天气 " + done + "/" + total });
+    }
+    // 无论有无风险都展示当天天气（好天气也要能看到"用了 Weather API"）；有风险则追加"，注意X"。
+    if (res.ok && res.data && res.data.summary) {
+      var head = "第 " + t.dayLabel + " 天（" + t.date + "）" +
+        (t.geo.resolvedCity ? ("・" + t.geo.resolvedCity) : "") + "：" + res.data.summary;
+      return res.data.risk ? (head + "，注意" + res.data.risk + "。") : (head + "。");
+    }
+    return null;
+  });
+  return results.filter(Boolean);
+}
+
+// v1.5 拉取当前顺序下各景点营业时间，构建 openingHoursByPlace（含 verifyState），供闭馆风险校验消费。
+// 工具未启用/降级时返回空表或标注 unverified，主流程不中断（doc §8.3）。
+async function fetchOpeningHoursForOrder(order, registry, toolContext, placeDateMap, onProgress, options) {
+  var result = {};
+  if (!registry || !registry.isEnabled("opening_hours")) {
+    return result;
+  }
+  var opts = options || {};
+  var dateMap = placeDateMap || {};
+  var names = (Array.isArray(order) ? order : []).filter(Boolean);
+
+  // #1 可选范围收窄：scope=high 时仅查高优先级景点，省调用/省钱（低优景点闭馆退化为常识兜底）。
+  if (opts.scope === "high" && opts.placeMetaMap) {
+    var filtered = names.filter(function (name) {
+      var meta = opts.placeMetaMap[agentPlanner.normalizeName(name)] || {};
+      return String(meta.priority || "").toLowerCase() === "high";
+    });
+    // 全都不是高优先级时不至于「一个都不查」，回退到全量，避免闭馆校验完全失明。
+    if (filtered.length) {
+      names = filtered;
+    }
+  }
+
+  var total = names.length;
+  var done = 0;
+  var entries = await mapWithConcurrency(names, opts.concurrency, async function (name) {
+    var meta = dateMap[agentPlanner.normalizeName(name)] || {};
+    var res = await registry.invoke("opening_hours", { placeName: name, date: meta.date || "" });
+    done += 1;
+    if (typeof onProgress === "function") {
+      onProgress({ stage: "opening_hours", message: "查询营业时间 " + done + "/" + total });
+    }
+    if (res.ok && res.data) {
+      return { key: agentPlanner.normalizeName(name), value: {
+        open: res.data.open,
+        close: res.data.close,
+        verifyState: res.data.verifyState || "verified",
+        source: res.data.source,
+      } };
+    }
+    if (res.degraded) {
+      // 降级：标注 unverified，闭馆校验据此不判硬失败（仅 warn）。
+      return { key: agentPlanner.normalizeName(name), value: {
+        open: null,
+        close: null,
+        verifyState: "unverified",
+        source: res.tool,
+      } };
+    }
+    return null;
+  });
+  entries.forEach(function (entry) {
+    if (entry) {
+      result[entry.key] = entry.value;
+    }
+  });
+  toolContext.openingHoursByPlace = result;
+  return result;
 }
 
 function buildPlaceMetaMap(places, analysisPlaces, toolContext) {
@@ -954,6 +1327,7 @@ function assembleResult(ctx, options) {
     : agentPlanner.buildDailyPlansFromPlanData(ctx.planData, normalized.lodging, ctx.planData.length, {
         travelLookup: ctx.travelLookup,
         transitLookup: ctx.transitLookup,
+        openingHoursByPlace: ctx.openingHoursByPlace || null,
       });
   var closureResult = agentPlanner.verifyHotelClosure(dailyPlans, normalized.lodging);
 
@@ -1046,9 +1420,18 @@ function assembleResult(ctx, options) {
     ctx.chosenRoute ? ctx.chosenRoute.source : "llm"
   );
   // v1.4 结构化策略解释（含次优对比与 scoreGap）
+  // #3/#4：以最终交付顺序（聚类/修复后）重打分，确保解释的得分构成与上面 routeMetrics 同源一致。
+  var deliveredRoute = agentPlanner.rescoreChosenForDelivery(
+    finalOrder,
+    ctx.chosenRoute,
+    ctx.placeMetaMap,
+    ctx.travelLookup,
+    strategyTemplate.id,
+    ctx.body.transportPreference
+  );
   var strategyExplanation = agentPlanner.buildStrategyExplanationDetail(
     strategyTemplate.id,
-    ctx.chosenRoute
+    deliveredRoute
   );
   var combinedRouteStrategy = [strategyExplanationText, strategyExplanation.reason, analysis.routeStrategy]
     .filter(Boolean)
@@ -1062,6 +1445,7 @@ function assembleResult(ctx, options) {
     var secDaily = agentPlanner.buildDailyPlansFromPlanData(secPlanData, normalized.lodging, sec.days, {
       travelLookup: ctx.travelLookup,
       transitLookup: ctx.transitLookup,
+      openingHoursByPlace: ctx.openingHoursByPlace || null,
     });
     var secMetrics = agentPlanner.computeRouteMetrics(sec.order, ctx.placeMetaMap, ctx.travelLookup);
     var secVerify = verifier.runVerifiers({
@@ -1102,7 +1486,8 @@ function assembleResult(ctx, options) {
     transitBreakdown: ctx.transitBreakdown,
     placeSpotlights: filterSpotlightsByOrder(analysis.placeSpotlights, finalOrderSet),
     roadbook: filterRoadbookByOrder(analysis.roadbook, finalOrderSet),
-    precautions: analysis.precautions || [],
+    // v1.5：把天气风险提示并入注意事项（来自 Google Weather，已核实来源）
+    precautions: (Array.isArray(ctx.weatherNotes) ? ctx.weatherNotes : []).concat(analysis.precautions || []),
     recommendedOrder: finalOrder,
     enrichedPlaces: finalPlaces,
     planData: ctx.planData,
@@ -1253,6 +1638,8 @@ function buildPlanStates(ctx, pushProgress) {
         ).filter(function (item) {
           return !excludedSet.has(normalizeText(item.name));
         });
+        // #2：把用户设置的「每个景点游玩时长」回填到无显式时长的景点，向下游 planData/分天/体力校验一致传导。
+        applyDefaultVisitDuration(enrichedPlaces, normalized.visitMinutes);
         context.enrichedPlaces = enrichedPlaces;
 
         var averageTravelMin = calcAverageTravelMinutesFromRoadbook(analysis.roadbook);
@@ -1287,6 +1674,53 @@ function buildPlanStates(ctx, pushProgress) {
         );
         context.transitLookup = makeTransitLookup(context.transitBreakdown);
 
+        // v1.5 工具层：拉取当前顺序下各景点营业时间 + 按天天气（默认开启，走注册表统一缓存/降级/埋点）。
+        var registry = buildToolRegistry(context.toolContext, context.tracer, body.mapsApiKey);
+        context.toolRegistry = registry;
+        // 景点 → 实际游玩日期，供 opening_hours/weather 按当天查询（修复"按今天查"）。
+        var placeDateMap = buildPlaceDateMap(context.planData, normalized.lodging);
+        context.placeDateMap = placeDateMap;
+        if (registry.isEnabled("opening_hours")) {
+          pushProgress({ percent: 89, stage: "opening_hours", message: "查询景点营业时间" });
+        }
+        context.openingHoursByPlace = await fetchOpeningHoursForOrder(
+          effectiveOrder,
+          registry,
+          context.toolContext,
+          placeDateMap,
+          function (ohProgress) {
+            pushProgress({ percent: 89, stage: "opening_hours", message: ohProgress.message || "查询营业时间" });
+          },
+          { concurrency: TOOL_FETCH_CONCURRENCY, scope: OPENING_HOURS_SCOPE, placeMetaMap: placeMetaMap }
+        );
+        // 按天天气 → 注意事项（precautions）
+        if (registry.isEnabled("weather")) {
+          pushProgress({ percent: 90, stage: "weather", message: "查询目的地天气" });
+        }
+        context.weatherNotes = await fetchWeatherNotes(
+          context.planData,
+          placeDateMap,
+          registry,
+          context.toolContext,
+          function (wProgress) {
+            pushProgress({ percent: 90, stage: "weather", message: wProgress.message || "查询天气" });
+          },
+          TOOL_FETCH_CONCURRENCY
+        );
+        // v1.5 校验层输入：闭馆风险（依赖 opening_hours）+ 体力强度（用户偏好档位）+ 回酒店往返 + 拥堵修正（高峰启发式）。
+        var physicalPreset = verifier.getPhysicalPreset(body.physicalPreference);
+        context.v15Checks = {
+          openingHoursByPlace: context.openingHoursByPlace,
+          dayStartMin: DAY_START_MIN,
+          physicalLoad: {
+            enabled: PHYSICAL_CHECK_ENABLED,
+            maxVisitMinutes: physicalPreset.maxVisitMinutes,
+            maxVisits: physicalPreset.maxVisits,
+          },
+          hotelReturnCost: { enabled: HOTEL_RETURN_CHECK_ENABLED },
+          congestion: { enabled: registry.isEnabled("congestion") },
+        };
+
         return { next: "verify", status: "ok" };
       },
     },
@@ -1297,7 +1731,11 @@ function buildPlanStates(ctx, pushProgress) {
           context.planData,
           normalized.lodging,
           context.planData.length,
-          { travelLookup: context.travelLookup, transitLookup: context.transitLookup }
+          {
+            travelLookup: context.travelLookup,
+            transitLookup: context.transitLookup,
+            openingHoursByPlace: context.openingHoursByPlace || null,
+          }
         );
         var vr = verifier.runVerifiers({
           planData: context.planData,
@@ -1305,6 +1743,7 @@ function buildPlanStates(ctx, pushProgress) {
           lodging: normalized.lodging,
           requestedDays: context.estimated.requestedDays,
           cityOf: context.repairContext.cityOf,
+          checks: context.v15Checks || null,
         });
         context.verifyResult = vr;
         context.scoreHistory.push(vr.score);
@@ -1652,4 +2091,6 @@ if (require.main === module) {
 module.exports = {
   decideDayPlan: decideDayPlan,
   buildAgentPlanPayload: buildAgentPlanPayload,
+  mapWithConcurrency: mapWithConcurrency,
+  applyDefaultVisitDuration: applyDefaultVisitDuration,
 };

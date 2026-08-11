@@ -4,10 +4,12 @@
 // 本 schema 是全项目埋点基线，后续版本（v1.4~v1.7）在其上扩展字段，v1.7 可观测体系直接消费。
 // 约束：埋点不得阻塞主流程；埋点异常必须记录日志（遵循「无静默失败」），不得静默吞掉。
 // v1.4：新增 strategy_select / scoring / alternative_compare 三类事件（复用统一 emit 通道），schema 升至 1.4.0。
+// v1.5：新增 fact_source / tool_degrade 两类事件；tool_call 复用统一通道承载新工具（opening_hours/weather/congestion）
+//       的 provider/cacheHit/degraded；validation 承载新增 code（OPENING_RISK/PHYSICAL_OVERLOAD/HOTEL_RETURN_COST）。schema 升至 1.5.0。
 
 var crypto = require("crypto");
 
-var SCHEMA_VERSION = "1.4.0";
+var SCHEMA_VERSION = "1.5.0";
 
 function newId() {
   if (crypto && typeof crypto.randomUUID === "function") {
@@ -153,6 +155,37 @@ function createTracer(options) {
     });
   }
 
+  // v1.5 外部事实来源审计：记录每条外部事实的来源、抓取时间与可信状态。
+  function factSource(info) {
+    var i = info || {};
+    return emit({
+      stage: "tool",
+      eventType: "fact_source",
+      status: i.verifyState === "unverified" ? "warn" : "ok",
+      payload: {
+        tool: i.tool,
+        source: i.source,
+        fetchedAt: i.fetchedAt,
+        verifyState: i.verifyState,
+      },
+    });
+  }
+
+  // v1.5 工具降级审计：记录降级触发的工具、原因与是否使用了兜底数据（不静默）。
+  function toolDegrade(info) {
+    var i = info || {};
+    return emit({
+      stage: "tool",
+      eventType: "tool_degrade",
+      status: "warn",
+      payload: {
+        tool: i.tool,
+        reason: i.reason,
+        fallbackUsed: Boolean(i.fallbackUsed),
+      },
+    });
+  }
+
   // 工具调用统一包裹：自动记录 durationMs / ok / cacheHit
   function withTrace(toolName, fn, meta) {
     var started = Date.now();
@@ -200,6 +233,8 @@ function createTracer(options) {
     validation: validation,
     repairAction: repairAction,
     fallback: fallback,
+    factSource: factSource,
+    toolDegrade: toolDegrade,
     withTrace: withTrace,
     snapshot: snapshot,
   };
