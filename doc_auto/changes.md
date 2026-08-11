@@ -455,3 +455,85 @@
 > 后续若增加"出行日期/日期区间"输入，可将默认改回开启，届时日期门控天然生效。
 
 修改时间：2026-08-11 13:20 (UTC+8)
+
+## 2026-08-11（内测 v1.6 首个特性：多酒店 / 换酒店按日闭环）
+
+范围调整：v1.6「长期记忆」因 Render 文件系统临时性 **PENDING**（详见 `内测-v1.6-前瞻规划.md` §0），本版本先实现不依赖记忆的「多酒店 / 换酒店」输入模型重构（§11）。
+
+- **输入模型重构**：景点与酒店拆分为两个独立区块；删除景点行的「景点/酒店」类型下拉；新增独立「住宿（酒店）」区块（可选、可多家，每家含名称/地址/入住/离店日期）。
+- **后端多酒店模型**（`agent-planner.js`）：新增 `extractHotels`、`buildDayHotelMap`（第 N 天→当天酒店映射，换酒店 `changeFrom`、空档 `gapDays`）、`validateLodging`（离店≤入住/区间重叠/空档校验）；`buildDailyPlansFromPlanData` 按当日酒店闭环 + **换酒店日行李转移腿**（`luggageTransfer`）+ 空档退化；`verifyHotelClosure` 按当日酒店判定（未标注 hotelName 回退主酒店，兼容单酒店）。
+- **server 接线**：`buildDefaultLodging` 支持 `hotels` 数组（`mode:multi`，保留 `hotel` 主指针）；酒店预解析多家循环 geocode；`buildPlaceDateMap` 改用 `buildDayHotelMap` 统一推日期；`lodgingSummary` 输出全部酒店；`lodgingWarnings` 并入日期校验结论。
+- **决策对照**（v1.6 §11.3）：日期粒度=仅日期；换酒店日=算新酒店 + 行李转移；空档日=退化无酒店闭环 + 提醒（两者都做）。
+- **测试**：新增 `tests/multi-hotel.test.js`（16 例）；全量 `node --test` 通过 **137/137**；修复闭环契约变更引发的 2 个存量回归（`agent-planner`/`verifier` 用例）。
+- 涉及文件：`agent-planner.js`、`server.js`、`app.js`、`index.html`、`styles.css`、`tests/multi-hotel.test.js`、`package.json`（test 脚本纳入新用例）。
+
+> 局部重算（v1.6 §8.1）仍待实现；长期记忆 PENDING 待持久化存储方案确定。
+
+修改时间：2026-08-11 16:25 (UTC+8)
+
+## 2026-08-11（内测 v1.6 第二个特性：局部重算 Incremental Replan）
+
+实现 v1.6 §8.1「局部重算」。已定范围：支持 **删除（`remove_place`）+ 移到另一天（`move_place`）** 两类改点；受影响天做「重排序（打分）+ 重算闭环 + 校验」，其余天原样冻结复用；**纯本地计算，不重新调用地图/LLM**（后端无状态，拿不到上次坐标缓存，同时这也是"省调用、耗时下降"的关键）。
+
+- **新增 `replan.js`**：`analyzeImpact`（影响域，删=所在天/移=源天+目标天，"宁可多算一日也不能漏"）、`applyChange`（不改入参应用改点）、`buildTravelLookupFromDailyPlans`（从既有分段建通勤查表，双向命中）、`reoptimizeAffectedDays`（仅受影响天用 `generateCandidateOrders`+`chooseBestOrder` 重排序）、`incrementalReplan`（编排 + `reusedRatio`）。
+- **server 接线**：新增 `POST /api/agent/replan`（走限流）；重建 `placeMetaMap`/`travelLookup` → `incrementalReplan` → `buildDailyPlansFromPlanData` 重组 → `verifyHotelClosure`+`runVerifiers`；缺失/非法 `changeEvent`、空 `planData` 返回 400（不静默失败）。
+- **埋点**：`tracer.js` 新增 `incremental_replan` 事件（`changeType/affectedScope/reusedRatio/dayCount`），schema 升至 **1.6.0**。
+- **前端**（`app.js`/`styles.css`）：「按日行程」主方案每景点加「删除此点 / 移到第 N 天」控件（备选方案只读，事件委托到 `#itineraryResult`）；`performReplan` 调接口并把结果并回后重渲染路书 + 重绘地图，状态栏与概览区显示「仅重算第 X 天、复用 Y%」。
+- **测试**：新增 `tests/replan.test.js`（9 例）+ 端到端冒烟（移景点 `affectedDays=[2,3]`、`reusedRatio≈0.33`、目标天获点、`validation.pass`）；全量 `node --test` 通过 **146/146**。
+- 涉及文件：`replan.js`（新增）、`server.js`、`tracer.js`、`app.js`、`styles.css`、`tests/replan.test.js`、`package.json`。
+
+> 本版本 v1.6 两个 ACTIVE 特性（多酒店、局部重算）均已落地；长期记忆仍 PENDING 待持久化方案。当前范围内暂未做 `add_place`（新增点需 geocode，会打破"纯本地"，留待后续）。
+
+修改时间：2026-08-11 16:05 (UTC+8)
+
+## 2026-08-11（bug 修复：多酒店地图只标第一家）
+
+- **现象**：多酒店行程在地图上只标出第一家/主酒店。
+- **根因**：`app.js` 的 `renderRouteOnMap` 只读取 `lodgingSummary.formattedAddress/hotelName`（单家），未遍历 `lodgingSummary.hotels` 数组。
+- **修复**（`app.js`）：改为遍历 `hotels` 逐家标点（兼容旧单酒店结构），多酒店用 `H1/H2/…` 标签区分（单酒店仍为 `H`）；酒店坐标纳入 `fitBounds` 视野；`placeHotelMarker` 支持自定义 `label`；单家标点失败改为 `console.warn` 记录（不静默、不中断整体渲染）。
+- 后端无需改动：主规划与局部重算返回的 `lodgingSummary.hotels` 均为 `[{name, formattedAddress, checkInDate, checkOutDate}]`。
+
+修改时间：2026-08-11 16:18 (UTC+8)
+
+## 2026-08-11（bug 修复：多酒店地图只标第一家 · 补「在地图上标点」路径）
+
+- **背景**：上一条修复只覆盖了「Agent 智能规划」后的路线渲染（`renderRouteOnMap`）；「在地图上标点」按钮走的是 `markOrderedPlacesOnMap → resolveHotelForMap`，仍只取 `lodging.hotel` 一家。
+- **修复**（`app.js`）：新增 `resolveHotelsForMap`（复数），遍历 `lodging.hotels` 解析全部酒店坐标（兼容旧单 `lodging.hotel`），多酒店标签 `H1/H2/…`、单家仍 `H`，单家解析失败 `console.warn` 记录且不中断其余；`markOrderedPlacesOnMap` 改为逐家标点并把酒店纳入 `fitBounds`，状态栏显示「标记 N 家酒店」。
+- 至此地图两条标点路径（智能规划路线、手动在地图上标点）均支持多酒店。
+
+修改时间：2026-08-11 16:40 (UTC+8)
+
+## 2026-08-11（版本号）
+
+- `index.html` 页面标题与页头 `内测 v1.5` → `内测 v1.6`；`package.json` `version` `1.5.4` → `1.6.0`（tracer schema 已同步 `1.6.0`）。
+
+修改时间：2026-08-11 16:40 (UTC+8)
+
+## 2026-08-11（规划优化：真实通勤估天数 + 按城市软对齐分天 + 体力衰减）
+
+针对双城（哥本哈根+马尔默）用例反馈的两个问题：①系统误估 1 天；②同一天内跨城（用户预期一天一城/综合往返最省）。根因与修复：
+
+- **问题①根因**：天数估算里的平均通勤取自 **LLM 乐观路书**（把跨海段严重低估）→ `450+6×16+50≈600` 卡成 1 天；真实通勤 302 分钟本应估 2 天，但真实值是定完天数后才算的。
+  - **修复（混合口径，`server.js`）**：新增 `buildCoordLookup` / `haversineKm` / `haversineTravelMin` / `estimateAverageTravelMinHybrid`——天数估算改为**优先用 `travelCache` 真实通勤，缺失相邻段用坐标 haversine（分段速度：<5km 18km/h、<30km 35km/h、≥30km 60km/h）兜底**。零额外 Google API 调用（Directions 仍只在第 4 步对最终跨城段调用），由真实地理距离驱动，跨城/跨海自然变长，**不引入人为「跨城惩罚」**。新增 `day_estimate` 埋点。
+- **问题②根因**：`buildPlanDataFromOrder` 按**点数均分**切天，7 点/2 天 → 4+3，把 1 个马尔默点并进了哥本哈根那天。
+  - **修复（按城市软对齐，`agent-planner.js`）**：新增 `splitPlacesIntoCityAlignedDays`（+ `chunkContiguousPlaces` / `mergeCityRunsIntoGroups`）——先按城市切「连续同城段」，天数≥城市数时每段至少 1 天、多余天分给最拥挤城市并段内连续均分；天数<城市数时合并相邻「点数之和最小」的城市段（软对齐、不强制一天一城、跨城不可避免时最少化）。`buildPlanDataFromOrder` 新增 `options.cityOf`（缺省退化为旧的连续均分，向后兼容）；server 主/次方案均注入 `placeMetaMap` 的城市。本例即得 Day1=哥本哈根(3)、Day2=马尔默(4)。
+- **体力衰减（新增，rate=0.1，用户确认）**：`agent-planner.js` 新增 `fatigueAdjustedVisitMin`——同一天第 k 个景点（0 基）有效游玩耗时 ×(1+0.1k)；并入 `evaluateTimeFeasibility` 的单日耗时（进而作用于 verifier 的 `TIME_OVERLOAD` 与 `suggestedDays`），单日堆点会被放大、自然倾向分到更多天。
+- **测试**：`tests/agent-planner.test.js` 新增 6 例（城市对齐分天:等于/多于/少于城市数、无城市退化、疲劳工具、疲劳并入单日耗时）；调整 `tests/verifier.test.js` 的 PHYSICAL_OVERLOAD 边界数据（原 3×200 恰好触发含疲劳后的 TIME_OVERLOAD，改为 3×160 以聚焦「体力=warn、计划仍 pass」）。全量 `node --test` **152/152** 通过。
+- 涉及文件：`agent-planner.js`、`server.js`、`tests/agent-planner.test.js`、`tests/verifier.test.js`。
+
+修改时间：2026-08-11 17:35 (UTC+8)
+
+## 2026-08-11（天数估算重做：逐日装箱 + 单日预算随体力强度联动）
+
+承接上一条。用户再次反馈仍估 1 天，并指出**「单链上限 10h」与「体力强度设置」脱钩**（选 7h 档位，天数估算仍按 10h）。核查确认后重做：
+
+- **核查结论（两套数从没打通）**：
+  - 单日 **10h(600 分钟)** 是硬编码常量，出现在三处（`server.js` 估算、`agent-planner.js` `evaluateTimeFeasibility`、`verifier.js` `DAY_BUDGET_MIN`），管「游玩+通勤」总量；
+  - 体力档位只产出 `maxVisitMinutes`(5/7/9h)+`maxVisits`(4/6/8)，是**纯游玩**上限（不含通勤），且**只**喂给独立的 `PHYSICAL_OVERLOAD` 提醒，**完全不参与天数估算/超载预算**。二者量纲不同、从无关联。
+- **修复①天数估算改为「逐日装箱」（`server.js` 重写 `estimateNaturalDaysAndSubset`）**：从 1 天起按城市软对齐切分，取「每天都可行」的最小天数。每天须**同时**满足体力档位三条约束：①纯游玩（含 0.1 疲劳、每天重置）≤ `maxVisitMinutes`；②景点数 ≤ `maxVisits`；③**游玩+段间通勤+当天各自的酒店往返** ≤ 单日总预算×slack。通勤走**混合口径**（新增 `makeHybridLegMin`：真实 `travelCache` 优先→坐标 haversine 兜底），酒店往返每天各算一次（主酒店坐标近似，跨城日自然更贵）。`compactPlaces` 亦按同一约束在 `reqDays` 内按城市软对齐装箱、溢出计入 `droppedPlaces`。
+- **修复②单日预算随体力强度缩放（用户确认 8/10/12h）**：`verifier.js` 的体力档位新增 `dayBudgetMin`（轻松 480 / 标准 600 / 硬核 720），并新增 `DAY_BUDGET_SLACK=0.85`（单日只填到预算的 85%，留 15% 时间冗余，用户确认）。`evaluateTimeFeasibility` 新增 `options.dayBudgetMin/slack`（缺省 600、无 buffer，向后兼容）；`runVerifiers` 的 `TIME_OVERLOAD` 改用 `checks.dayBudgetMin/dayBudgetSlack`；`server.js` 的 `v15Checks` 与估算调用点都从体力档位透传，三处口径彻底统一。体力强度自此真正影响「该排几天」。
+- **效果（双城 7 点用例）**：7 点堆一天，疲劳后纯游玩 819 分钟 > 420(标准)且 7 > 6 → 1 天不可行 → **估 2 天**；同一 4 点单城行程，标准档=1 天、轻松档=2 天，验证强度联动。
+- **测试**：新增 `tests/day-estimate.test.js`（8 例：小负载 1 天 / 跨城 7 点估 2 天 / 强度联动 4 点 / compact 溢出丢点 / `makeHybridLegMin` 三级回退 / `evaluateTimeFeasibility` 预算注入 / `TIME_OVERLOAD` 预算生效）；更新 `tests/verifier.test.js` 的 `getPhysicalPreset` 断言（含 `dayBudgetMin`）。全量 `node --test` **159/159** 通过。
+- 涉及文件：`server.js`、`verifier.js`、`agent-planner.js`、`package.json`、`tests/day-estimate.test.js`、`tests/verifier.test.js`。
+
+修改时间：2026-08-11 18:20 (UTC+8)

@@ -3,12 +3,12 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>旅行规划 Agent · 内测 v1.5</title>
+  <title>旅行规划 Agent · 内测 v1.6</title>
   <link rel="stylesheet" href="./styles.css" />
 </head>
 <body>
   <header class="topbar">
-    <h1>旅行规划 Agent · 内测 v1.5</h1>
+    <h1>旅行规划 Agent · 内测 v1.6</h1>
     <p>多国家/多城市层级输入 + 可选酒店锚点；策略引擎（多策略打分 + 候选剪枝 + 打分兜底）、按城市聚类分天、跨城公共交通分段与酒店闭环硬约束；可插拔工具层（营业时间等外部事实）与扩展校验（闭馆/体力/回酒店往返）。</p>
   </header>
 
@@ -22,13 +22,18 @@
       </label>
       <button id="connectMapBtn" type="button">连接 Google 地图</button>
 
-      <h3>行程目的地与点位</h3>
-      <p class="tips">每行可选择“景点/酒店”，默认是景点；若选酒店，将作为可选酒店锚点使用。</p>
+      <h3>行程目的地与景点</h3>
+      <p class="tips">按国家/城市层级填写景点；酒店已独立到下方「住宿（酒店）」区块单独管理。</p>
       <div id="destinationsRoot" class="destinations-root"></div>
       <button id="addCountryBtn" type="button" class="btn-secondary">+ 添加国家/地区</button>
       <button id="markMapBtn" type="button">在地图上标点</button>
 
       <p id="statusText" class="status">请填写层级目的地与景点，连接地图后点击「在地图上标点」。</p>
+
+      <h3>住宿（酒店）</h3>
+      <p class="tips">选填，可添加多家。填写入住/离店日期后，将按每天所住酒店分段计算首尾腿；换酒店当天自动加行李转移。留空则全程按「无酒店」规划（保护隐私）。</p>
+      <div id="hotelsList" class="hotels-list"></div>
+      <button id="addHotelBtn" type="button" class="btn-secondary">+ 添加酒店</button>
 
       <h3>已解析点位</h3>
       <div id="placesList" class="places-list"></div>

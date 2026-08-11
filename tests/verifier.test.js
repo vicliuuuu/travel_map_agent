@@ -162,10 +162,10 @@ test("computeArrivalTimeline applies congestion factor in peak windows", () => {
 });
 
 test("getPhysicalPreset maps preferences to thresholds", () => {
-  assert.deepEqual(verifier.getPhysicalPreset("easy"), { maxVisitMinutes: 300, maxVisits: 4 });
-  assert.deepEqual(verifier.getPhysicalPreset("standard"), { maxVisitMinutes: 420, maxVisits: 6 });
-  assert.deepEqual(verifier.getPhysicalPreset("hardcore"), { maxVisitMinutes: 540, maxVisits: 8 });
-  assert.deepEqual(verifier.getPhysicalPreset("unknown"), { maxVisitMinutes: 420, maxVisits: 6 });
+  assert.deepEqual(verifier.getPhysicalPreset("easy"), { maxVisitMinutes: 300, maxVisits: 4, dayBudgetMin: 480 });
+  assert.deepEqual(verifier.getPhysicalPreset("standard"), { maxVisitMinutes: 420, maxVisits: 6, dayBudgetMin: 600 });
+  assert.deepEqual(verifier.getPhysicalPreset("hardcore"), { maxVisitMinutes: 540, maxVisits: 8, dayBudgetMin: 720 });
+  assert.deepEqual(verifier.getPhysicalPreset("unknown"), { maxVisitMinutes: 420, maxVisits: 6, dayBudgetMin: 600 });
 });
 
 test("OPENING_RISK is inactive without openingHoursByPlace (backward compatible)", () => {
@@ -236,12 +236,14 @@ test("OPENING_RISK downgrades to warn when data unverified (not a hard fail)", (
 });
 
 test("PHYSICAL_OVERLOAD warns when daily visit minutes exceed threshold", () => {
+  // 3×160=480 分钟原始游览（超过 420 体力阈值），但含 v1.6 体力衰减后（160+176+192=528）
+  // 仍低于单日 600 分钟时间预算，避免误触 TIME_OVERLOAD，聚焦「体力超载=warn、计划仍 pass」。
   const planData = [visitDay(1, ["A", "B", "C"])];
   const dailyPlans = [
     { day: 1, segments: [
-      { type: "visit", placeName: "A", visitDurationMin: 200 },
-      { type: "visit", placeName: "B", visitDurationMin: 200 },
-      { type: "visit", placeName: "C", visitDurationMin: 200 },
+      { type: "visit", placeName: "A", visitDurationMin: 160 },
+      { type: "visit", placeName: "B", visitDurationMin: 160 },
+      { type: "visit", placeName: "C", visitDurationMin: 160 },
     ] },
   ];
   const res = verifier.runVerifiers({

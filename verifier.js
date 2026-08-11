@@ -7,7 +7,9 @@
 var agentPlanner = require("./agent-planner.js");
 var tools = require("./tools.js");
 
-var DAY_BUDGET_MIN = 10 * 60; // 单日可用时长预算（分钟），与既有排程口径一致
+var DAY_BUDGET_MIN = 10 * 60; // 单日可用时长预算（分钟）默认值，可被体力档位/checks 覆盖
+// v1.6：单日只填到预算的该比例，其余留作时间冗余 buffer（用户确认 0.85 → 留 15%）。
+var DAY_BUDGET_SLACK = 0.85;
 var CROSS_CITY_CONFLICT_THRESHOLD = 2; // 单日跨城切换 >= 该值判定为「同日反复跨城」
 
 // v1.5 新增校验阈值（可由 runVerifiers 的 checks 选项覆盖，便于按偏好/回归调参）
@@ -19,10 +21,12 @@ var DEFAULT_HOTEL_RETURN_MAX_RATIO = 0.35; // 单日回酒店往返时长占当�
 var DEFAULT_TRANSIT_FALLBACK_MIN = 30;
 
 // v1.5 体力强度偏好档位（用户可在前端自选，映射到单日游览时长/景点数上限）。
+// v1.6：新增 dayBudgetMin（单日「游玩+通勤+酒店往返」总时长预算），让体力强度真正影响「该排几天」，
+// 不再与写死的 10h 脱钩。maxVisitMinutes 是「纯游玩」上限（不含通勤），二者量纲不同、各司其职。
 var PHYSICAL_PRESETS = {
-  easy: { maxVisitMinutes: 5 * 60, maxVisits: 4 },
-  standard: { maxVisitMinutes: 7 * 60, maxVisits: 6 },
-  hardcore: { maxVisitMinutes: 9 * 60, maxVisits: 8 },
+  easy: { maxVisitMinutes: 5 * 60, maxVisits: 4, dayBudgetMin: 8 * 60 },
+  standard: { maxVisitMinutes: 7 * 60, maxVisits: 6, dayBudgetMin: 10 * 60 },
+  hardcore: { maxVisitMinutes: 9 * 60, maxVisits: 8, dayBudgetMin: 12 * 60 },
 };
 
 function getPhysicalPreset(preference) {
@@ -158,20 +162,30 @@ function runVerifiers(context) {
   var findings = [];
   var score = 0;
 
-  // 1) TIME_OVERLOAD：单日超载（含酒店往返交通）
-  var feasibility = agentPlanner.evaluateTimeFeasibility(dailyPlans, requestedDays);
+  // 1) TIME_OVERLOAD：单日超载（含酒店往返交通）。
+  // v1.6：单日预算随体力强度而变（checks.dayBudgetMin），并按 checks.dayBudgetSlack 预留时间冗余，
+  // 与 estimateNaturalDaysAndSubset / evaluateTimeFeasibility 口径一致。
+  var baseBudget = Number.isFinite(Number(checks.dayBudgetMin)) ? Number(checks.dayBudgetMin) : DAY_BUDGET_MIN;
+  var budgetSlack = Number.isFinite(Number(checks.dayBudgetSlack)) && Number(checks.dayBudgetSlack) > 0
+    ? Number(checks.dayBudgetSlack)
+    : 1;
+  var usableBudget = Math.max(1, Math.round(baseBudget * budgetSlack));
+  var feasibility = agentPlanner.evaluateTimeFeasibility(dailyPlans, requestedDays, {
+    dayBudgetMin: baseBudget,
+    slack: budgetSlack,
+  });
   (feasibility.overloadedDays || []).forEach(function (item) {
-    var over = Math.max(0, Number(item.estimatedMinutes) - DAY_BUDGET_MIN);
+    var over = Math.max(0, Number(item.estimatedMinutes) - usableBudget);
     score += over;
     findings.push({
       code: CODES.TIME_OVERLOAD,
       level: "error",
       pass: false,
-      message: "第 " + item.day + " 天预计约 " + item.estimatedMinutes + " 分钟，超过单日 " + DAY_BUDGET_MIN + " 分钟预算。",
+      message: "第 " + item.day + " 天预计约 " + item.estimatedMinutes + " 分钟，超过单日 " + usableBudget + " 分钟可用预算。",
       evidence: {
         day: item.day,
         estimatedMinutes: item.estimatedMinutes,
-        budgetMinutes: DAY_BUDGET_MIN,
+        budgetMinutes: usableBudget,
         overMinutes: over,
       },
     });
@@ -393,6 +407,7 @@ function runVerifiers(context) {
 module.exports = {
   CODES: CODES,
   DAY_BUDGET_MIN: DAY_BUDGET_MIN,
+  DAY_BUDGET_SLACK: DAY_BUDGET_SLACK,
   CROSS_CITY_CONFLICT_THRESHOLD: CROSS_CITY_CONFLICT_THRESHOLD,
   DEFAULT_DAY_START_MIN: DEFAULT_DAY_START_MIN,
   DEFAULT_PHYSICAL_MAX_VISIT_MIN: DEFAULT_PHYSICAL_MAX_VISIT_MIN,

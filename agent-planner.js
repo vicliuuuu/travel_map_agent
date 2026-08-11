@@ -83,7 +83,99 @@ function applyAgentInsights(places, analysisPlaces, recommendedOrder, placeSpotl
   return sortByRecommendedOrder(enriched, recommendedOrder);
 }
 
-function buildPlanDataFromOrder(recommendedOrder, places, city, totalDays) {
+// v1.6 体力衰减：同一天内第 k 个景点（0 基）的有效游玩耗时 = 时长 ×(1 + rate×k)。
+// 越往后越累，单日堆点会被放大，自然倾向把点分到更多天。rate 默认 0.1（用户确认）。
+var FATIGUE_RATE = 0.1;
+function fatigueAdjustedVisitMin(visitDurationsInOrder, rate) {
+  var r = Number.isFinite(Number(rate)) ? Number(rate) : FATIGUE_RATE;
+  var list = Array.isArray(visitDurationsInOrder) ? visitDurationsInOrder : [];
+  return list.reduce(function (acc, dur, idx) {
+    return acc + (Number(dur) || 0) * (1 + r * idx);
+  }, 0);
+}
+
+// 把一组 places 连续切成 n 块（base+余数前置），保持顺序不打散。
+function chunkContiguousPlaces(places, n) {
+  var out = [];
+  var count = Math.max(1, Number(n) || 1);
+  var base = Math.floor(places.length / count);
+  var remainder = places.length % count;
+  var cursor = 0;
+  var k;
+  for (k = 0; k < count; k += 1) {
+    var take = base + (k < remainder ? 1 : 0);
+    out.push(places.slice(cursor, cursor + take));
+    cursor += take;
+  }
+  return out;
+}
+
+// v1.6：天数 < 城市段数时，把相邻城市段合并成 days 组。
+// 策略：反复合并「相邻两段点数之和最小」的一对，直到组数=days——
+// 让大城市段尽量独占一天、把小段并到一起，跨城日不可避免时也控制在最少。
+function mergeCityRunsIntoGroups(runs, days) {
+  var work = runs.map(function (r) { return r.places.slice(); });
+  while (work.length > days) {
+    var bestI = 0;
+    var bestSum = Infinity;
+    var j;
+    for (j = 0; j + 1 < work.length; j += 1) {
+      var sum = work[j].length + work[j + 1].length;
+      if (sum < bestSum) {
+        bestSum = sum;
+        bestI = j;
+      }
+    }
+    work[bestI] = work[bestI].concat(work[bestI + 1]);
+    work.splice(bestI + 1, 1);
+  }
+  return work;
+}
+
+// v1.6：按城市软对齐分天。orderedPlaces 已按城市聚类，据此切「连续同城段」runs：
+//  - days >= runs 数：每段至少 1 天，多出的天迭代分给「点数/已分配天数」最拥挤的段，段内再连续均分；
+//  - days <  runs 数：把相邻段合并成 days 组（见 mergeCityRunsIntoGroups），允许跨城日（软对齐、不强制一天一城）。
+// 无城市信息（cityOf 全空）时退化为单段 → 等价旧的「连续均分」，保持向后兼容。
+function splitPlacesIntoCityAlignedDays(orderedPlaces, days, cityOf) {
+  var lookup = typeof cityOf === "function" ? cityOf : function () { return ""; };
+  var runs = [];
+  orderedPlaces.forEach(function (place) {
+    var c = normalizeName(lookup(place.name));
+    var last = runs[runs.length - 1];
+    if (last && last.city === c) {
+      last.places.push(place);
+    } else {
+      runs.push({ city: c, places: [place] });
+    }
+  });
+
+  if (days >= runs.length) {
+    var alloc = runs.map(function (r) { return { places: r.places, dayCount: 1 }; });
+    var extra = days - runs.length;
+    while (extra > 0) {
+      var idxMax = 0;
+      var loadMax = -1;
+      alloc.forEach(function (a, i) {
+        var load = a.places.length / a.dayCount;
+        if (load > loadMax) {
+          loadMax = load;
+          idxMax = i;
+        }
+      });
+      alloc[idxMax].dayCount += 1;
+      extra -= 1;
+    }
+    var groups = [];
+    alloc.forEach(function (a) {
+      groups = groups.concat(chunkContiguousPlaces(a.places, a.dayCount));
+    });
+    return groups;
+  }
+
+  return mergeCityRunsIntoGroups(runs, days);
+}
+
+function buildPlanDataFromOrder(recommendedOrder, places, city, totalDays, options) {
   var orderedPlaces = sortByRecommendedOrder(
     Array.isArray(places) ? places.slice() : [],
     Array.isArray(recommendedOrder) ? recommendedOrder : []
@@ -97,23 +189,9 @@ function buildPlanDataFromOrder(recommendedOrder, places, city, totalDays) {
     days = 1;
   }
 
-  var buckets = [];
-  var dayIndex;
-  for (dayIndex = 0; dayIndex < days; dayIndex += 1) {
-    buckets.push([]);
-  }
-
-  // 连续分块（contiguous chunk）而非轮询分桶：保留按城市/邻近聚类的顺序，
-  // 让相邻（常为同城）的景点落在同一天，避免每日无谓跨城往返（见 OI-1）。
-  // 余数前置：前 remainder 天各多分 1 个点。
-  var base = Math.floor(orderedPlaces.length / days);
-  var remainder = orderedPlaces.length % days;
-  var cursor = 0;
-  for (dayIndex = 0; dayIndex < days; dayIndex += 1) {
-    var take = base + (dayIndex < remainder ? 1 : 0);
-    buckets[dayIndex] = orderedPlaces.slice(cursor, cursor + take);
-    cursor += take;
-  }
+  // v1.6：按城市软对齐分天（cityOf 由调用方注入；缺省退化为旧的连续均分，向后兼容）。
+  var opts = options || {};
+  var buckets = splitPlacesIntoCityAlignedDays(orderedPlaces, days, opts.cityOf);
 
   return buckets.map(function (dayPlaces, index) {
     return {
@@ -275,30 +353,210 @@ function buildTransitSegment(fromTitle, toTitle, options) {
   return segment;
 }
 
+// v1.6 多酒店：日期解析工具（统一走 UTC 零点，避免时区漂移）。
+function parseDateUTC(text) {
+  var t = String(text || "").trim();
+  if (!t) {
+    return null;
+  }
+  var d = new Date(t + "T00:00:00Z");
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function toDateStr(dateObj) {
+  return dateObj.toISOString().slice(0, 10);
+}
+
+// v1.6 多酒店：把 lodging 归一化为酒店数组（兼容 mode:single 的 lodging.hotel 与 mode:multi 的 lodging.hotels）。
+function extractHotels(lodging) {
+  if (!lodging) {
+    return [];
+  }
+  var raw = [];
+  if (Array.isArray(lodging.hotels) && lodging.hotels.length) {
+    raw = lodging.hotels.slice();
+  } else if (lodging.hotel) {
+    raw = [lodging.hotel];
+  }
+  return raw.filter(function (h) {
+    return h && (String(h.name || "").trim() || String(h.address || "").trim());
+  });
+}
+
+// v1.6 多酒店：构建「第 N 天 → 当天酒店」映射。
+// 规则（见 内测-v1.6-前瞻规划.md §11）：
+//   - 无酒店：全程 hotel=null（无酒店闭环）；
+//   - 单酒店：全程该酒店（兼容旧行为），日期从 checkInDate 起算；
+//   - 多酒店（2+ 且带日期）：按 checkIn<=date<checkOut 判定当天酒店；
+//     换酒店日（旧酒店 checkOut==当天 且 新酒店 checkIn==当天）记 changeFrom；
+//     无覆盖日记入 gapDays（退化无酒店闭环 + 提醒）。
+function buildDayHotelMap(lodging, totalDays) {
+  var count = Math.max(1, Math.floor(Number(totalDays) || 1));
+  var hotels = extractHotels(lodging);
+  var days = [];
+  var gapDays = [];
+  var i;
+
+  if (!hotels.length) {
+    for (i = 0; i < count; i += 1) {
+      days.push({ day: i + 1, date: "", hotel: null, changeFrom: null });
+    }
+    return { days: days, gapDays: [], hasDates: false, hotels: [] };
+  }
+
+  if (hotels.length === 1) {
+    // 单酒店：全程覆盖（兼容旧「全程固定酒店」行为），日期从 checkInDate 起算。
+    var only = hotels[0];
+    var ci1 = parseDateUTC(only.checkInDate);
+    for (i = 0; i < count; i += 1) {
+      var dstr = ci1 ? toDateStr(new Date(ci1.getTime() + i * 86400000)) : "";
+      days.push({ day: i + 1, date: dstr, hotel: only, changeFrom: null });
+    }
+    return { days: days, gapDays: [], hasDates: Boolean(ci1), hotels: hotels };
+  }
+
+  // 多酒店：仅带合法日期区间的酒店参与按日覆盖判定。
+  var dated = hotels.filter(function (h) {
+    var ci = parseDateUTC(h.checkInDate);
+    var co = parseDateUTC(h.checkOutDate);
+    return ci && co && co.getTime() > ci.getTime();
+  });
+  if (!dated.length) {
+    // 多家但都没填日期 → 无法按日安排，退化为「全程第一家」。
+    var primary = hotels[0];
+    for (i = 0; i < count; i += 1) {
+      days.push({ day: i + 1, date: "", hotel: primary, changeFrom: null });
+    }
+    return { days: days, gapDays: [], hasDates: false, hotels: hotels };
+  }
+
+  var starts = dated.map(function (h) { return parseDateUTC(h.checkInDate).getTime(); });
+  var tripStart = new Date(Math.min.apply(null, starts));
+  for (i = 0; i < count; i += 1) {
+    var dayDate = new Date(tripStart.getTime() + i * 86400000);
+    var t = dayDate.getTime();
+    var covering = null;
+    var leaving = null;
+    dated.forEach(function (h) {
+      var ci = parseDateUTC(h.checkInDate);
+      var co = parseDateUTC(h.checkOutDate);
+      if (ci.getTime() <= t && t < co.getTime()) {
+        covering = h;
+      }
+      if (co.getTime() === t) {
+        leaving = h;
+      }
+    });
+    var changeFrom = null;
+    if (covering && leaving && leaving !== covering &&
+      parseDateUTC(covering.checkInDate).getTime() === t) {
+      // 换酒店日：旧酒店今日离店、新酒店今日入住 → 当天算新酒店，早上从旧酒店转移行李。
+      changeFrom = leaving;
+    }
+    if (!covering) {
+      gapDays.push(i + 1);
+    }
+    days.push({ day: i + 1, date: toDateStr(dayDate), hotel: covering, changeFrom: changeFrom });
+  }
+  return { days: days, gapDays: gapDays, hasDates: true, hotels: hotels };
+}
+
+// v1.6 多酒店：酒店日期合法性校验（离店早于/等于入住、区间重叠、空档日）。
+// 返回 { errors, warnings }；errors 为硬问题（阻断），warnings 为软提醒。
+function validateLodging(lodging, totalDays) {
+  var errors = [];
+  var warnings = [];
+  var hotels = extractHotels(lodging);
+  if (hotels.length <= 1) {
+    // 单酒店/无酒店无需区间校验；仍检查单酒店日期方向。
+    if (hotels.length === 1) {
+      var ci0 = parseDateUTC(hotels[0].checkInDate);
+      var co0 = parseDateUTC(hotels[0].checkOutDate);
+      if (ci0 && co0 && co0.getTime() <= ci0.getTime()) {
+        errors.push("酒店「" + (hotels[0].name || "未命名") + "」离店日期须晚于入住日期。");
+      }
+    }
+    return { errors: errors, warnings: warnings };
+  }
+
+  var intervals = [];
+  hotels.forEach(function (h) {
+    var ci = parseDateUTC(h.checkInDate);
+    var co = parseDateUTC(h.checkOutDate);
+    var label = h.name || "未命名酒店";
+    if (!ci || !co) {
+      warnings.push("酒店「" + label + "」未填写完整的入住/离店日期，多酒店安排下该酒店不会被排入任何一天。");
+      return;
+    }
+    if (co.getTime() <= ci.getTime()) {
+      errors.push("酒店「" + label + "」离店日期须晚于入住日期。");
+      return;
+    }
+    intervals.push({ label: label, start: ci.getTime(), end: co.getTime() });
+  });
+
+  // 区间重叠检测：允许「离店日 == 下一家入住日」的衔接（半开区间 [start,end)），仅当真正重叠才提醒。
+  intervals.sort(function (a, b) { return a.start - b.start; });
+  var j;
+  for (j = 1; j < intervals.length; j += 1) {
+    if (intervals[j].start < intervals[j - 1].end) {
+      warnings.push("酒店「" + intervals[j - 1].label + "」与「" + intervals[j].label + "」的入住区间重叠，请核对日期（同一晚不应住两家）。");
+    }
+  }
+
+  var map = buildDayHotelMap(lodging, totalDays);
+  if (map.gapDays.length) {
+    warnings.push("第 " + map.gapDays.join("、") + " 天没有酒店覆盖，将按「无酒店闭环」处理，请确认是否需要补充住宿。");
+  }
+  return { errors: errors, warnings: warnings };
+}
+
+// v1.6 多酒店：找出一组 segments 里第一段「非行李转移」的 transit（用于闭环起点判定）。
+function firstTouringTransit(segments) {
+  var list = Array.isArray(segments) ? segments : [];
+  var i;
+  for (i = 0; i < list.length; i += 1) {
+    if (list[i] && list[i].type === "transit" && !list[i].luggageTransfer) {
+      return list[i];
+    }
+  }
+  return null;
+}
+
 function buildDailyPlansFromPlanData(planData, lodging, totalDays, options) {
   var safePlan = Array.isArray(planData) ? planData : [];
   if (!safePlan.length) {
     return [];
   }
-  var hotelName = lodging && lodging.hotel && lodging.hotel.name
-    ? String(lodging.hotel.name).trim()
-    : "";
-  var hasHotel = Boolean(hotelName);
-  var checkInDateText = lodging && lodging.hotel && lodging.hotel.checkInDate
-    ? String(lodging.hotel.checkInDate).trim()
-    : "";
-  var checkInDate = checkInDateText ? new Date(checkInDateText + "T00:00:00Z") : null;
   var opts = options || {};
   // v1.5.2 #1：把营业时间（Google Places）透出到每个景点，供前端展示与自证数据来源。
   var openingHoursByPlace = opts.openingHoursByPlace || null;
+  // v1.6 多酒店：按天解析当日酒店（单酒店/无酒店场景兼容旧行为）。
+  var effectiveDays = Math.max(safePlan.length, Math.floor(Number(totalDays) || safePlan.length));
+  var hotelMap = buildDayHotelMap(lodging, effectiveDays);
 
   return safePlan.map(function (dayPlan, index) {
+    var dayInfo = hotelMap.days[index] || { hotel: null, changeFrom: null, date: "" };
+    var dayHotel = dayInfo.hotel;
+    var hotelName = dayHotel ? String(dayHotel.name || "").trim() : "";
+    var hasHotel = Boolean(hotelName);
+    var changeFromName = dayInfo.changeFrom ? String(dayInfo.changeFrom.name || "").trim() : "";
+
     var items = (Array.isArray(dayPlan.items) ? dayPlan.items : []).filter(function (item) {
       return item && item.type === "visit";
     });
     var segments = [];
+
+    // v1.6 换酒店日：早上从旧酒店出发，先把行李转移到新酒店（独立标记的 transit 段）。
+    if (hasHotel && changeFromName && changeFromName !== hotelName) {
+      var luggage = buildTransitSegment(changeFromName, hotelName, opts);
+      luggage.luggageTransfer = true;
+      luggage.note = "换酒店：行李从「" + changeFromName + "」转移至「" + hotelName + "」";
+      segments.push(luggage);
+    }
+
     items.forEach(function (item, itemIndex) {
-      // v1.2 酒店闭环硬约束：有酒店时每日首段必须从酒店出发
+      // v1.2 酒店闭环硬约束：有酒店时每日首段必须从（当日）酒店出发
       if (itemIndex === 0 && hasHotel) {
         segments.push(buildTransitSegment(hotelName, item.title, opts));
       }
@@ -316,23 +574,19 @@ function buildDailyPlansFromPlanData(planData, lodging, totalDays, options) {
       if (nextItem) {
         segments.push(buildTransitSegment(item.title, nextItem.title, opts));
       } else if (hasHotel) {
-        // v1.2 酒店闭环硬约束：末段必须返回酒店
+        // v1.2 酒店闭环硬约束：末段必须返回（当日）酒店
         segments.push(buildTransitSegment(item.title, hotelName, opts));
       }
     });
 
-    var dateText = "";
-    if (checkInDate && !Number.isNaN(checkInDate.getTime())) {
-      var dateObj = new Date(checkInDate.getTime() + (index * 24 * 60 * 60 * 1000));
-      dateText = dateObj.toISOString().slice(0, 10);
-    }
+    var dateText = dayInfo.date || "";
 
     var closedLoop = true;
     if (hasHotel && items.length) {
-      var firstSeg = segments[0];
+      var firstSeg = firstTouringTransit(segments);
       var lastSeg = segments[segments.length - 1];
       closedLoop = Boolean(
-        firstSeg && firstSeg.type === "transit" && firstSeg.from === hotelName &&
+        firstSeg && firstSeg.from === hotelName &&
         lastSeg && lastSeg.type === "transit" && lastSeg.to === hotelName
       );
     }
@@ -341,6 +595,7 @@ function buildDailyPlansFromPlanData(planData, lodging, totalDays, options) {
       day: Number(dayPlan.day) || (index + 1),
       date: dateText,
       hotelName: hotelName,
+      changeFromHotel: changeFromName || "",
       closedLoop: closedLoop,
       segments: segments,
     };
@@ -348,23 +603,38 @@ function buildDailyPlansFromPlanData(planData, lodging, totalDays, options) {
 }
 
 function verifyHotelClosure(dailyPlans, lodging) {
-  var hotelName = lodging && lodging.hotel && lodging.hotel.name
-    ? String(lodging.hotel.name).trim()
-    : "";
-  if (!hotelName) {
+  var hotels = extractHotels(lodging);
+  if (!hotels.length) {
     return { closed: true, warnings: [], openDays: [] };
   }
+  // 主酒店：用于未标注每日 hotelName 的旧结构 dailyPlans（单酒店行为）。
+  var fallbackName = String(hotels[0].name || "").trim();
   var openDays = [];
   (Array.isArray(dailyPlans) ? dailyPlans : []).forEach(function (dayPlan) {
     var segments = Array.isArray(dayPlan.segments) ? dayPlan.segments : [];
     if (!segments.length) {
       return;
     }
-    var first = segments[0];
+    // v1.6：优先按「当日酒店」判定闭环；
+    //   - 显式标注 hotelName="" → 多酒店空档日，不要求闭环（由 validateLodging 提醒）；
+    //   - 未标注 hotelName（旧结构）→ 回退到主酒店，保持单酒店旧行为。
+    var dayHotelName;
+    if (Object.prototype.hasOwnProperty.call(dayPlan, "hotelName")) {
+      dayHotelName = String(dayPlan.hotelName || "").trim();
+      if (!dayHotelName) {
+        return;
+      }
+    } else {
+      dayHotelName = fallbackName;
+    }
+    if (!dayHotelName) {
+      return;
+    }
+    var first = firstTouringTransit(segments);
     var last = segments[segments.length - 1];
     var closed = Boolean(
-      first && first.type === "transit" && first.from === hotelName &&
-      last && last.type === "transit" && last.to === hotelName
+      first && first.from === dayHotelName &&
+      last && last.type === "transit" && last.to === dayHotelName
     );
     if (!closed) {
       openDays.push(dayPlan.day);
@@ -960,22 +1230,29 @@ function parseTransitLegs(directionsResponse) {
   };
 }
 
-function evaluateTimeFeasibility(dailyPlans, requestedDays) {
+function evaluateTimeFeasibility(dailyPlans, requestedDays, options) {
   var safePlans = Array.isArray(dailyPlans) ? dailyPlans : [];
   var overloadedDays = [];
   var totalMinutes = 0;
-  var dailyBudgetMin = 10 * 60;
+  // v1.6：单日预算可由调用方按体力强度注入，并按 slack 预留时间冗余；缺省保持 10h、无 buffer（向后兼容）。
+  var opts = options || {};
+  var baseBudget = Number.isFinite(Number(opts.dayBudgetMin)) ? Number(opts.dayBudgetMin) : 10 * 60;
+  var slack = Number.isFinite(Number(opts.slack)) && Number(opts.slack) > 0 ? Number(opts.slack) : 1;
+  var dailyBudgetMin = Math.max(1, Math.round(baseBudget * slack));
 
   safePlans.forEach(function (dayPlan) {
     var segments = Array.isArray(dayPlan.segments) ? dayPlan.segments : [];
-    var dayTotal = 0;
+    // v1.6：单日游览耗时按出现顺序计入体力衰减；通勤时长照原样累加。
+    var visitDurations = [];
+    var transitTotal = 0;
     segments.forEach(function (segment) {
       if (segment.type === "visit") {
-        dayTotal += Number(segment.visitDurationMin) || 90;
+        visitDurations.push(Number(segment.visitDurationMin) || 90);
       } else if (segment.type === "transit") {
-        dayTotal += Number(segment.durationMin) || 30;
+        transitTotal += Number(segment.durationMin) || 30;
       }
     });
+    var dayTotal = Math.round(fatigueAdjustedVisitMin(visitDurations, FATIGUE_RATE)) + transitTotal;
     totalMinutes += dayTotal;
     if (dayTotal > dailyBudgetMin) {
       overloadedDays.push({
@@ -1036,10 +1313,16 @@ module.exports = {
   applyAgentInsights: applyAgentInsights,
   sortByRecommendedOrder: sortByRecommendedOrder,
   buildPlanDataFromOrder: buildPlanDataFromOrder,
+  splitPlacesIntoCityAlignedDays: splitPlacesIntoCityAlignedDays,
+  fatigueAdjustedVisitMin: fatigueAdjustedVisitMin,
+  FATIGUE_RATE: FATIGUE_RATE,
   buildDailyPlansFromRoadbook: buildDailyPlansFromRoadbook,
   buildDailyPlansFromPlanData: buildDailyPlansFromPlanData,
   evaluateTimeFeasibility: evaluateTimeFeasibility,
   verifyHotelClosure: verifyHotelClosure,
+  extractHotels: extractHotels,
+  buildDayHotelMap: buildDayHotelMap,
+  validateLodging: validateLodging,
   getStrategyTemplate: getStrategyTemplate,
   listStrategyTemplates: listStrategyTemplates,
   computeRouteMetrics: computeRouteMetrics,

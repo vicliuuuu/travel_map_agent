@@ -6,10 +6,11 @@
 // v1.4：新增 strategy_select / scoring / alternative_compare 三类事件（复用统一 emit 通道），schema 升至 1.4.0。
 // v1.5：新增 fact_source / tool_degrade 两类事件；tool_call 复用统一通道承载新工具（opening_hours/weather/congestion）
 //       的 provider/cacheHit/degraded；validation 承载新增 code（OPENING_RISK/PHYSICAL_OVERLOAD/HOTEL_RETURN_COST）。schema 升至 1.5.0。
+// v1.6：新增 incremental_replan 事件（局部重算，payload 含 changeType/affectedScope/reusedRatio/dayCount），复用统一 emit 通道，schema 升至 1.6.0。
 
 var crypto = require("crypto");
 
-var SCHEMA_VERSION = "1.5.0";
+var SCHEMA_VERSION = "1.6.0";
 
 function newId() {
   if (crypto && typeof crypto.randomUUID === "function") {

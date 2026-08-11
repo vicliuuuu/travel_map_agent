@@ -139,10 +139,57 @@ body {
 .places-grid-header,
 .places-grid-row {
   display: grid;
-  grid-template-columns: 36px 1fr 1fr 88px 36px;
+  grid-template-columns: 36px 1fr 1fr 36px;
   gap: 6px;
   align-items: center;
   padding: 8px;
+}
+
+/* v1.6 多酒店：住宿区块行 */
+.hotels-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.hotel-row {
+  display: grid;
+  grid-template-columns: 1.2fr 1.4fr 150px 150px 36px;
+  gap: 6px;
+  align-items: end;
+}
+
+.hotel-row input[type="text"] {
+  width: 100%;
+  margin: 0;
+  padding: 7px 8px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  font-size: 13px;
+}
+
+.hotel-date-label {
+  display: flex;
+  flex-direction: column;
+  font-size: 12px;
+  color: #64748b;
+  gap: 2px;
+  margin-bottom: 0;
+}
+
+.hotel-date-label input[type="date"] {
+  margin: 0;
+  padding: 6px 8px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  font-size: 13px;
+}
+
+@media (max-width: 720px) {
+  .hotel-row {
+    grid-template-columns: 1fr 1fr;
+  }
 }
 
 .city-places-grid-body {
@@ -521,6 +568,55 @@ button[disabled] {
   margin: 4px 0 0 0;
   font-size: 12px;
   color: #64748b;
+}
+
+/* v1.6 局部重算：景点操作控件 */
+.station-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-top: 6px;
+  flex-wrap: wrap;
+}
+
+.btn-replan-remove {
+  font-size: 12px;
+  padding: 2px 8px;
+  border: 1px solid #fca5a5;
+  color: #b91c1c;
+  background: #fef2f2;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.btn-replan-remove:hover {
+  background: #fee2e2;
+}
+
+.replan-move-select {
+  font-size: 12px;
+  padding: 2px 6px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  background: #fff;
+  color: #334155;
+  cursor: pointer;
+}
+
+.replan-hint {
+  margin: 0 0 8px 0;
+}
+
+.roadbook-replan-info {
+  background: #ecfdf5;
+  border-left: 3px solid #10b981;
+  padding: 8px 12px;
+  font-size: 13px;
+  color: #065f46;
+}
+
+.roadbook-replan-info p {
+  margin: 0;
 }
 
 .station-hours {
