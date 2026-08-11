@@ -11,6 +11,7 @@ var verifier = require("./verifier.js");
 var repair = require("./repair.js");
 var stateMachine = require("./state-machine.js");
 var tools = require("./tools.js");
+var replan = require("./replan.js");
 
 // v1.3 收敛控制参数（可用环境变量覆盖，便于回归调参）
 var MAX_REPAIR_ROUNDS = Number(process.env.MAX_REPAIR_ROUNDS || repair.MAX_REPAIR_ROUNDS);
@@ -176,23 +177,43 @@ function countryConflicts(declaredCountry, resolvedCountry) {
   return !isSameLoose(declaredCountry, resolvedCountry);
 }
 
-function buildDefaultLodging(lodging) {
-  if (!lodging || !lodging.hotel) {
+function normalizeHotelEntry(hotel) {
+  if (!hotel) {
     return null;
   }
-  var name = String(lodging.hotel.name || "").trim();
-  var address = String(lodging.hotel.address || "").trim();
+  var name = String(hotel.name || "").trim();
+  var address = String(hotel.address || "").trim();
   if (!name && !address) {
     return null;
   }
   return {
-    mode: "single",
-    hotel: {
-      name: name,
-      address: address,
-      checkInDate: String(lodging.hotel.checkInDate || "").trim(),
-      checkOutDate: String(lodging.hotel.checkOutDate || "").trim(),
-    },
+    name: name,
+    address: address,
+    checkInDate: String(hotel.checkInDate || "").trim(),
+    checkOutDate: String(hotel.checkOutDate || "").trim(),
+  };
+}
+
+// v1.6 多酒店：优先解析 lodging.hotels 数组（mode:multi），兼容旧的单 lodging.hotel（mode:single）。
+// 保留 lodging.hotel 作为「主酒店」指针，兼容仍读取 lodging.hotel 的存量代码。
+function buildDefaultLodging(lodging) {
+  if (!lodging) {
+    return null;
+  }
+  var rawHotels = [];
+  if (Array.isArray(lodging.hotels) && lodging.hotels.length) {
+    rawHotels = lodging.hotels;
+  } else if (lodging.hotel) {
+    rawHotels = [lodging.hotel];
+  }
+  var hotels = rawHotels.map(normalizeHotelEntry).filter(Boolean);
+  if (!hotels.length) {
+    return null;
+  }
+  return {
+    mode: hotels.length > 1 ? "multi" : "single",
+    hotel: hotels[0],
+    hotels: hotels,
   };
 }
 
@@ -202,15 +223,19 @@ function splitLodgingFromPlaces(flatPlaces, fallbackLodging) {
   var filtered = [];
   places.forEach(function (place) {
     if (place.isHotel) {
+      // v1.6：酒店已改为独立区块传入（lodging.hotels）。此处仅为兼容旧的「景点行标记为酒店」输入，
+      // 当 lodging 尚未由酒店区块构建时，才把该行降级为单酒店锚点。
       if (!lodging) {
+        var legacyHotel = {
+          name: String(place.name || "酒店").trim(),
+          address: String(place.addressExtra || place.address || "").trim(),
+          checkInDate: "",
+          checkOutDate: "",
+        };
         lodging = {
           mode: "single",
-          hotel: {
-            name: String(place.name || "酒店").trim(),
-            address: String(place.addressExtra || place.address || "").trim(),
-            checkInDate: "",
-            checkOutDate: "",
-          },
+          hotel: legacyHotel,
+          hotels: [legacyHotel],
         };
       }
       return;
@@ -349,14 +374,21 @@ async function preGeocodeInput(toolContext, mapsApiKey, onProgress) {
       // keep going to let LLM/validation handle unresolved places
     }
   }
-  var hotel = toolContext.input.lodging && toolContext.input.lodging.hotel
-    ? toolContext.input.lodging.hotel
-    : null;
-  if (hotel && (hotel.name || hotel.address)) {
+  // v1.6 多酒店：逐个预解析酒店坐标（兼容单酒店）。
+  var lodgingInput = toolContext.input.lodging || null;
+  var hotels = lodgingInput && Array.isArray(lodgingInput.hotels) && lodgingInput.hotels.length
+    ? lodgingInput.hotels
+    : (lodgingInput && lodgingInput.hotel ? [lodgingInput.hotel] : []);
+  var hi;
+  for (hi = 0; hi < hotels.length; hi += 1) {
+    var hotel = hotels[hi];
+    if (!hotel || (!hotel.name && !hotel.address)) {
+      continue;
+    }
     if (typeof onProgress === "function") {
       onProgress({
         stage: "pre_geocode",
-        message: "预解析酒店位置",
+        message: hotels.length > 1 ? ("预解析酒店位置（" + (hi + 1) + "/" + hotels.length + "）") : "预解析酒店位置",
       });
     }
     try {
@@ -372,7 +404,7 @@ async function preGeocodeInput(toolContext, mapsApiKey, onProgress) {
       );
       hotel.resolvedAddress = hotelGeo.formattedAddress;
     } catch (err) {
-      // no-op
+      // 保持与景点预解析一致的容错：单个酒店解析失败不阻断主流程，交由后续校验/展示处理。
     }
   }
 }
@@ -682,15 +714,12 @@ function applyDefaultVisitDuration(places, fallbackMinutes) {
 
 function buildPlaceDateMap(planData, lodging) {
   var map = {};
-  var checkInText = lodging && lodging.hotel && lodging.hotel.checkInDate
-    ? String(lodging.hotel.checkInDate).trim()
-    : "";
-  var checkIn = checkInText ? new Date(checkInText + "T00:00:00Z") : null;
-  (Array.isArray(planData) ? planData : []).forEach(function (dayPlan, index) {
-    var date = "";
-    if (checkIn && !Number.isNaN(checkIn.getTime())) {
-      date = new Date(checkIn.getTime() + index * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-    }
+  var plan = Array.isArray(planData) ? planData : [];
+  // v1.6 多酒店：日期改由 buildDayHotelMap 统一推算（多酒店取最早入住日为行程起点），
+  // 保证营业时间/天气按真实游玩日期查询。
+  var dayMap = agentPlanner.buildDayHotelMap(lodging, plan.length || 1);
+  plan.forEach(function (dayPlan, index) {
+    var date = (dayMap.days[index] && dayMap.days[index].date) || "";
     (Array.isArray(dayPlan.items) ? dayPlan.items : []).forEach(function (item) {
       if (item && item.type === "visit" && item.title) {
         map[agentPlanner.normalizeName(item.title)] = { date: date, day: Number(dayPlan.day) || (index + 1) };
@@ -1091,6 +1120,73 @@ function resolvePlaceDurationMin(place, fallbackMinutes) {
   return Math.max(30, Math.floor(candidate));
 }
 
+// v1.6 天数估算：坐标查表（来自预 geocode，全量、真实、免费）。
+function buildCoordLookup(toolContext) {
+  var byName = (toolContext && toolContext.geocodeByName) || {};
+  return function (name) {
+    var g = byName[String(name || "").trim().toLowerCase()];
+    if (g && Number.isFinite(Number(g.lat)) && Number.isFinite(Number(g.lng))) {
+      return { lat: Number(g.lat), lng: Number(g.lng) };
+    }
+    return null;
+  };
+}
+
+function haversineKm(a, b) {
+  if (!a || !b) {
+    return null;
+  }
+  var R = 6371;
+  var toRad = Math.PI / 180;
+  var dLat = (b.lat - a.lat) * toRad;
+  var dLng = (b.lng - a.lng) * toRad;
+  var lat1 = a.lat * toRad;
+  var lat2 = b.lat * toRad;
+  var sinLat = Math.sin(dLat / 2);
+  var sinLng = Math.sin(dLng / 2);
+  var h = sinLat * sinLat + Math.cos(lat1) * Math.cos(lat2) * sinLng * sinLng;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
+}
+
+// 直线距离→通勤分钟（仅用于「该排几天」的粗判）：短途按城市道路慢速、长途按快速路/城际提速。
+// 由真实地理距离驱动，跨城/跨海自然变长，无需人为「跨城惩罚」。
+function haversineTravelMin(a, b) {
+  var km = haversineKm(a, b);
+  if (km === null) {
+    return null;
+  }
+  var speedKmh = km < 5 ? 18 : (km < 30 ? 35 : 60);
+  return Math.max(5, Math.round((km / speedKmh) * 60));
+}
+
+// v1.6 混合口径平均通勤：优先用 travelCache 里已有的真实通勤，缺失相邻段用 haversine 兜底。
+// 零额外 API 调用，定天数时即时可用；取代此前「取自 LLM 乐观路书」的偏小估计。
+function estimateAverageTravelMinHybrid(order, travelLookup, coordOf, fallbackAvg) {
+  var names = (Array.isArray(order) ? order : []).filter(Boolean);
+  var fallback = Number.isFinite(Number(fallbackAvg)) ? Number(fallbackAvg) : 35;
+  if (names.length < 2) {
+    return fallback;
+  }
+  var samples = [];
+  var i;
+  for (i = 1; i < names.length; i += 1) {
+    var real = typeof travelLookup === "function" ? travelLookup(names[i - 1], names[i]) : null;
+    if (Number.isFinite(Number(real)) && Number(real) > 0) {
+      samples.push(Number(real));
+      continue;
+    }
+    var hv = haversineTravelMin(coordOf(names[i - 1]), coordOf(names[i]));
+    if (Number.isFinite(Number(hv)) && Number(hv) > 0) {
+      samples.push(Number(hv));
+    }
+  }
+  if (!samples.length) {
+    return fallback;
+  }
+  var sum = samples.reduce(function (acc, v) { return acc + v; }, 0);
+  return Math.max(10, Math.round(sum / samples.length));
+}
+
 function calcAverageTravelMinutesFromRoadbook(roadbook) {
   var samples = (Array.isArray(roadbook) ? roadbook : [])
     .map(function (item) {
@@ -1109,38 +1205,106 @@ function calcAverageTravelMinutesFromRoadbook(roadbook) {
   return Math.max(10, Math.round(sum / samples.length));
 }
 
-function estimateNaturalDaysAndSubset(orderedPlaces, requestedDays, averageTravelMin) {
+// v1.6：单段混合口径通勤（真实 travelCache 优先 → 坐标 haversine 兜底 → fallback），供逐日装箱估天数用。
+function makeHybridLegMin(travelLookup, coordOf, fallbackMin) {
+  var lookup = typeof travelLookup === "function" ? travelLookup : function () { return null; };
+  var coord = typeof coordOf === "function" ? coordOf : function () { return null; };
+  var fb = Number.isFinite(Number(fallbackMin)) ? Number(fallbackMin) : 30;
+  return function (fromName, toName) {
+    var real = lookup(fromName, toName);
+    if (Number.isFinite(Number(real)) && Number(real) > 0) {
+      return Number(real);
+    }
+    var hv = haversineTravelMin(coord(fromName), coord(toName));
+    if (Number.isFinite(Number(hv)) && Number(hv) > 0) {
+      return Number(hv);
+    }
+    return fb;
+  };
+}
+
+// v1.6：逐日「装箱」估该排几天。每天必须同时满足体力档位的三条约束：
+//   ① 纯游玩（含疲劳、每天重置）≤ maxVisitMinutes；
+//   ② 景点数 ≤ maxVisits；
+//   ③ 游玩 + 段间通勤 + 当天酒店往返 ≤ 单日总预算 ×slack（预留时间冗余 buffer）。
+// 通勤走混合口径（options.legMin），酒店往返每天各算一次（options.hotelLegMin，用主酒店坐标近似）。
+// 取满足约束的最小天数为 naturalDays；compactPlaces 为 reqDays 内按同一约束、按城市软对齐能容纳的子集。
+function estimateNaturalDaysAndSubset(orderedPlaces, requestedDays, options) {
   var list = Array.isArray(orderedPlaces) ? orderedPlaces : [];
   var reqDays = Number(requestedDays);
   if (!Number.isFinite(reqDays) || reqDays <= 0) {
     reqDays = 1;
   }
   reqDays = Math.floor(reqDays);
-  var dayBudgetMin = 10 * 60;
-  var hotelLegMin = 25;
 
-  var visitTotal = list.reduce(function (acc, place) {
-    return acc + resolvePlaceDurationMin(place, 90);
-  }, 0);
-  var fullTotal = visitTotal + Math.max(0, list.length - 1) * averageTravelMin + (list.length ? (2 * hotelLegMin) : 0);
-  var naturalDays = Math.max(1, Math.ceil(fullTotal / dayBudgetMin));
+  var opts = options || {};
+  var caps = opts.physicalCaps || {};
+  var maxVisitMin = Number.isFinite(Number(caps.maxVisitMinutes)) ? Number(caps.maxVisitMinutes) : 7 * 60;
+  var maxVisits = Number.isFinite(Number(caps.maxVisits)) ? Number(caps.maxVisits) : 6;
+  var baseBudget = Number.isFinite(Number(caps.dayBudgetMin)) ? Number(caps.dayBudgetMin) : 10 * 60;
+  var slack = Number.isFinite(Number(opts.slack)) && Number(opts.slack) > 0 ? Number(opts.slack) : 1;
+  var usableBudget = Math.max(1, Math.round(baseBudget * slack));
+  var fatigueRate = Number.isFinite(Number(opts.fatigueRate)) ? Number(opts.fatigueRate) : agentPlanner.FATIGUE_RATE;
+  var cityOf = typeof opts.cityOf === "function" ? opts.cityOf : function () { return ""; };
+  var legMin = typeof opts.legMin === "function" ? opts.legMin : function () { return 30; };
+  var hotelLegMin = typeof opts.hotelLegMin === "function" ? opts.hotelLegMin : function () { return 0; };
 
-  var compactBudget = reqDays * dayBudgetMin;
-  var compactUsed = 0;
+  function dayLoad(dayPlaces) {
+    var durations = dayPlaces.map(function (p) { return resolvePlaceDurationMin(p, 90); });
+    var visitFatigued = agentPlanner.fatigueAdjustedVisitMin(durations, fatigueRate);
+    var intra = 0;
+    var k;
+    for (k = 1; k < dayPlaces.length; k += 1) {
+      intra += Number(legMin(dayPlaces[k - 1].name, dayPlaces[k].name)) || 0;
+    }
+    var hotelRound = 0;
+    if (dayPlaces.length) {
+      hotelRound = (Number(hotelLegMin(dayPlaces[0].name)) || 0)
+        + (Number(hotelLegMin(dayPlaces[dayPlaces.length - 1].name)) || 0);
+    }
+    return {
+      visitFatigued: visitFatigued,
+      count: dayPlaces.length,
+      total: Math.round(visitFatigued + intra + hotelRound),
+    };
+  }
+  function dayFeasible(load) {
+    return load.visitFatigued <= maxVisitMin && load.count <= maxVisits && load.total <= usableBudget;
+  }
+
+  // naturalDays：从 1 天起按城市软对齐切分，找到「每天都可行」的最小天数（最坏一天一点）。
+  var naturalDays = Math.max(1, list.length);
+  var d;
+  for (d = 1; d <= list.length; d += 1) {
+    var buckets = agentPlanner.splitPlacesIntoCityAlignedDays(list, d, cityOf);
+    var allOk = buckets.length > 0 && buckets.every(function (b) {
+      return dayFeasible(dayLoad(b));
+    });
+    if (allOk) {
+      naturalDays = d;
+      break;
+    }
+  }
+  if (!list.length) {
+    naturalDays = 1;
+  }
+
+  // compactPlaces：reqDays 内按城市软对齐分天，逐天顺序装到「刚好可行」为止，溢出的点计入 droppedPlaces。
   var compactPlaces = [];
   var droppedPlaces = [];
-  var i;
-  for (i = 0; i < list.length; i += 1) {
-    var place = list[i];
-    var placeMinutes = resolvePlaceDurationMin(place, 90);
-    var transitMinutes = compactPlaces.length ? averageTravelMin : hotelLegMin;
-    var projected = compactUsed + placeMinutes + transitMinutes;
-    if (compactPlaces.length === 0 || projected + hotelLegMin <= compactBudget) {
-      compactPlaces.push(place);
-      compactUsed = projected;
-    } else {
-      droppedPlaces.push(place);
-    }
+  if (list.length) {
+    var reqBuckets = agentPlanner.splitPlacesIntoCityAlignedDays(list, reqDays, cityOf);
+    reqBuckets.forEach(function (bucket) {
+      var kept = [];
+      bucket.forEach(function (place) {
+        if (dayFeasible(dayLoad(kept.concat([place])))) {
+          kept.push(place);
+          compactPlaces.push(place);
+        } else {
+          droppedPlaces.push(place);
+        }
+      });
+    });
   }
 
   return {
@@ -1348,14 +1512,28 @@ function assembleResult(ctx, options) {
     overloadedDays: overloadedDays,
   };
 
+  // v1.6 多酒店：概览摘要输出全部酒店（主酒店字段保留兼容旧前端）。
+  var lodgingHotels = agentPlanner.extractHotels(normalized.lodging);
+  var primaryHotel = lodgingHotels[0] || null;
   var lodgingSummary = Object.assign(
     {
-      hotelName: normalized.lodging && normalized.lodging.hotel ? normalized.lodging.hotel.name : "",
-      formattedAddress: normalized.lodging && normalized.lodging.hotel ? normalized.lodging.hotel.resolvedAddress || normalized.lodging.hotel.address || "" : "",
-      checkInDate: normalized.lodging && normalized.lodging.hotel ? normalized.lodging.hotel.checkInDate : "",
-      checkOutDate: normalized.lodging && normalized.lodging.hotel ? normalized.lodging.hotel.checkOutDate : "",
+      hotelName: primaryHotel ? primaryHotel.name : "",
+      formattedAddress: primaryHotel ? (primaryHotel.resolvedAddress || primaryHotel.address || "") : "",
+      checkInDate: primaryHotel ? primaryHotel.checkInDate : "",
+      checkOutDate: primaryHotel ? primaryHotel.checkOutDate : "",
       nights: null,
-      note: normalized.lodging ? "全程固定酒店，每日往返" : "",
+      hotelCount: lodgingHotels.length,
+      hotels: lodgingHotels.map(function (h) {
+        return {
+          name: h.name || "",
+          formattedAddress: h.resolvedAddress || h.address || "",
+          checkInDate: h.checkInDate || "",
+          checkOutDate: h.checkOutDate || "",
+        };
+      }),
+      note: lodgingHotels.length > 1
+        ? "多酒店：按入住/离店日期分段闭环，换酒店日含行李转移"
+        : (normalized.lodging ? "全程固定酒店，每日往返" : ""),
     },
     analysis.lodgingSummary || {}
   );
@@ -1366,6 +1544,14 @@ function assembleResult(ctx, options) {
   }
   if (closureResult.warnings.length) {
     lodgingWarnings = lodgingWarnings.concat(closureResult.warnings);
+  }
+  // v1.6 多酒店：日期合法性/空档校验（离店早于入住、区间重叠、空档日）。
+  var lodgingValidation = agentPlanner.validateLodging(normalized.lodging, dailyPlans.length || ctx.planData.length);
+  if (lodgingValidation.errors.length) {
+    lodgingWarnings = lodgingWarnings.concat(lodgingValidation.errors);
+  }
+  if (lodgingValidation.warnings.length) {
+    lodgingWarnings = lodgingWarnings.concat(lodgingValidation.warnings);
   }
   if (isFallback) {
     lodgingWarnings.push("已输出保底可执行方案，但仍有未完全满足项，详见校验结论。");
@@ -1441,7 +1627,10 @@ function assembleResult(ctx, options) {
   var alternativePlan = null;
   if (ctx.secondarySpec) {
     var sec = ctx.secondarySpec;
-    var secPlanData = agentPlanner.buildPlanDataFromOrder(sec.order, sec.places, normalized.city, sec.days);
+    var secCityOf = function (name) {
+      return (ctx.placeMetaMap[agentPlanner.normalizeName(name)] || {}).city || "";
+    };
+    var secPlanData = agentPlanner.buildPlanDataFromOrder(sec.order, sec.places, normalized.city, sec.days, { cityOf: secCityOf });
     var secDaily = agentPlanner.buildDailyPlansFromPlanData(secPlanData, normalized.lodging, sec.days, {
       travelLookup: ctx.travelLookup,
       transitLookup: ctx.transitLookup,
@@ -1642,9 +1831,56 @@ function buildPlanStates(ctx, pushProgress) {
         applyDefaultVisitDuration(enrichedPlaces, normalized.visitMinutes);
         context.enrichedPlaces = enrichedPlaces;
 
-        var averageTravelMin = calcAverageTravelMinutesFromRoadbook(analysis.roadbook);
-        var estimated = estimateNaturalDaysAndSubset(enrichedPlaces, normalized.totalDays, averageTravelMin);
+        // v1.6：天数估算改用「混合口径」真实通勤（travelCache 真实值 + 坐标 haversine 兜底），
+        // 取代此前取自 LLM 乐观路书的偏小估计（那会把跨城/跨海段严重低估，误判成 1 天）。
+        var coordOf = buildCoordLookup(context.toolContext);
+        var roadbookAvg = calcAverageTravelMinutesFromRoadbook(analysis.roadbook);
+        var averageTravelMin = estimateAverageTravelMinHybrid(recommendedOrder, travelLookup, coordOf, roadbookAvg);
+        // v1.6：天数估算改为「逐日装箱」，约束来自用户所选体力档位（单日总预算随强度 8/10/12h + 15% 冗余），
+        // 每天纯游玩含疲劳 ≤ maxVisitMinutes、景点数 ≤ maxVisits、且含每天各自的酒店往返（主酒店坐标近似）。
+        var estimatePhysicalPreset = verifier.getPhysicalPreset(body.physicalPreference);
+        var estimateLegMin = makeHybridLegMin(travelLookup, coordOf, roadbookAvg);
+        var estimateHotels = agentPlanner.extractHotels(normalized.lodging);
+        var estimatePrimaryHotel = estimateHotels.length ? estimateHotels[0] : null;
+        var estimateHotelCoord = estimatePrimaryHotel && estimatePrimaryHotel.name
+          ? coordOf(estimatePrimaryHotel.name)
+          : null;
+        var estimateHotelLegMin = function (placeName) {
+          if (!estimatePrimaryHotel) {
+            return 0;
+          }
+          if (!estimateHotelCoord) {
+            return 25;
+          }
+          var hv = haversineTravelMin(estimateHotelCoord, coordOf(placeName));
+          return Number.isFinite(Number(hv)) && Number(hv) > 0 ? Number(hv) : 25;
+        };
+        var estimateCityOf = function (name) {
+          return (placeMetaMap[agentPlanner.normalizeName(name)] || {}).city || "";
+        };
+        var estimated = estimateNaturalDaysAndSubset(enrichedPlaces, normalized.totalDays, {
+          physicalCaps: estimatePhysicalPreset,
+          slack: verifier.DAY_BUDGET_SLACK,
+          cityOf: estimateCityOf,
+          legMin: estimateLegMin,
+          hotelLegMin: estimateHotelLegMin,
+        });
         context.estimated = estimated;
+        context.tracer.emit({
+          stage: "build_context",
+          eventType: "day_estimate",
+          status: "ok",
+          payload: {
+            averageTravelMin: averageTravelMin,
+            roadbookAvg: roadbookAvg,
+            dayBudgetMin: estimatePhysicalPreset.dayBudgetMin,
+            dayBudgetSlack: verifier.DAY_BUDGET_SLACK,
+            maxVisitMinutes: estimatePhysicalPreset.maxVisitMinutes,
+            maxVisits: estimatePhysicalPreset.maxVisits,
+            naturalDays: estimated.naturalDays,
+            requestedDays: estimated.requestedDays,
+          },
+        });
 
         // v1.3.1 天数冲突决策：决定主方案（进状态机做校验/修复）与可选的第二方案
         var dayPlan = decideDayPlan(estimated, enrichedPlaces);
@@ -1654,11 +1890,17 @@ function buildPlanStates(ctx, pushProgress) {
         context.droppedByDayFit = dayPlan.primary.dropped;
 
         var effectiveOrder = dayPlan.primary.order;
+        // v1.6：按城市软对齐分天——用 placeMetaMap 的城市把当日切在城市边界上，
+        // 避免「按点数均分」把同城景点拆到两天、或把跨城点塞进同一天。
+        var cityOfPlace = function (name) {
+          return (placeMetaMap[agentPlanner.normalizeName(name)] || {}).city || "";
+        };
         context.planData = agentPlanner.buildPlanDataFromOrder(
           dayPlan.primary.order,
           dayPlan.primary.places,
           normalized.city,
-          dayPlan.primary.days
+          dayPlan.primary.days,
+          { cityOf: cityOfPlace }
         );
 
         // v1.2 交通分段：对跨城相邻段调用 Google Directions transit 模式，输出可执行分段时长
@@ -1717,6 +1959,9 @@ function buildPlanStates(ctx, pushProgress) {
             maxVisitMinutes: physicalPreset.maxVisitMinutes,
             maxVisits: physicalPreset.maxVisits,
           },
+          // v1.6：把体力档位的单日总预算 + 时间冗余透传给 TIME_OVERLOAD/evaluateTimeFeasibility，口径统一。
+          dayBudgetMin: physicalPreset.dayBudgetMin,
+          dayBudgetSlack: verifier.DAY_BUDGET_SLACK,
           hotelReturnCost: { enabled: HOTEL_RETURN_CHECK_ENABLED },
           congestion: { enabled: registry.isEnabled("congestion") },
         };
@@ -1923,6 +2168,179 @@ async function handleAgentPlan(req, res) {
   }
 }
 
+// v1.6 局部重算：从回传结果重建 placeMeta（不含实时坐标，退化为声明城市）。
+function buildPlaceMetaMapFromEnriched(enrichedPlaces) {
+  var map = {};
+  (Array.isArray(enrichedPlaces) ? enrichedPlaces : []).forEach(function (p) {
+    if (!p) {
+      return;
+    }
+    var key = agentPlanner.normalizeName(p.name);
+    if (!key) {
+      return;
+    }
+    map[key] = {
+      city: p.city || p.declaredCity || "",
+      country: p.country || p.declaredCountry || "",
+      priority: p.llmPriority || p.priority || "medium",
+    };
+  });
+  return map;
+}
+
+// v1.6 局部重算主流程：应用改点 → 只重算受影响天 → 重建 dailyPlans → 校验 → 组装结果。
+// 纯本地计算（不调外部工具），复用当前行程已知通勤时长；无状态友好（所有输入来自请求体）。
+function buildAgentReplanPayload(body) {
+  var input = body || {};
+  var changeEvent = input.changeEvent || {};
+  if (!changeEvent.type || !changeEvent.placeName) {
+    var e1 = new Error("缺少 changeEvent");
+    e1.statusCode = 400;
+    e1.payload = { error: "缺少 changeEvent（需含 type 与 placeName）" };
+    throw e1;
+  }
+  if (changeEvent.type !== "remove_place" && changeEvent.type !== "move_place") {
+    var e2 = new Error("不支持的 changeEvent 类型");
+    e2.statusCode = 400;
+    e2.payload = { error: "不支持的 changeEvent 类型：" + changeEvent.type };
+    throw e2;
+  }
+  var planData = Array.isArray(input.planData) ? input.planData : [];
+  if (!planData.length) {
+    var e3 = new Error("planData 不能为空");
+    e3.statusCode = 400;
+    e3.payload = { error: "planData 不能为空" };
+    throw e3;
+  }
+
+  var lodging = buildDefaultLodging(input.lodging);
+  var placeMetaMap = buildPlaceMetaMapFromEnriched(input.enrichedPlaces);
+  var travelLookup = replan.buildTravelLookupFromDailyPlans(input.dailyPlans);
+  var strategy = agentPlanner.getStrategyTemplate(input.strategy).id;
+  var transportPreference = String(input.transportPreference || "driving").toLowerCase();
+
+  var requestTracer = tracer.createTracer();
+
+  var replanResult = replan.incrementalReplan({
+    planData: planData,
+    changeEvent: changeEvent,
+    placeMetaMap: placeMetaMap,
+    travelLookup: travelLookup,
+    strategy: strategy,
+    transportPreference: transportPreference,
+  });
+
+  var totalDays = replanResult.planData.length;
+  var newDailyPlans = agentPlanner.buildDailyPlansFromPlanData(replanResult.planData, lodging, totalDays, {
+    travelLookup: travelLookup,
+  });
+  var closure = agentPlanner.verifyHotelClosure(newDailyPlans, lodging);
+
+  var cityOf = function (name) {
+    var m = placeMetaMap[agentPlanner.normalizeName(name)] || {};
+    return m.city || "";
+  };
+  var physicalPreset = verifier.getPhysicalPreset(input.physicalPreference);
+  var verifyResult = verifier.runVerifiers({
+    planData: replanResult.planData,
+    dailyPlans: newDailyPlans,
+    lodging: lodging,
+    requestedDays: totalDays,
+    cityOf: cityOf,
+    checks: {
+      physicalLoad: {
+        enabled: true,
+        maxVisitMinutes: physicalPreset.maxVisitMinutes,
+        maxVisits: physicalPreset.maxVisits,
+      },
+    },
+  });
+
+  var recommendedOrder = [];
+  replanResult.planData.forEach(function (d) {
+    (Array.isArray(d.items) ? d.items : []).forEach(function (it) {
+      if (it && it.type === "visit" && it.title) {
+        recommendedOrder.push(it.title);
+      }
+    });
+  });
+
+  var effectiveMetrics = agentPlanner.computeRouteMetrics(recommendedOrder, placeMetaMap, travelLookup);
+  var dailyMetrics = agentPlanner.computeDailyMetrics(replanResult.planData, placeMetaMap, travelLookup);
+
+  var lodgingHotels = agentPlanner.extractHotels(lodging);
+  var primaryHotel = lodgingHotels[0] || null;
+  var lodgingSummary = {
+    hotelName: primaryHotel ? primaryHotel.name : "",
+    formattedAddress: primaryHotel ? (primaryHotel.resolvedAddress || primaryHotel.address || "") : "",
+    checkInDate: primaryHotel ? primaryHotel.checkInDate : "",
+    checkOutDate: primaryHotel ? primaryHotel.checkOutDate : "",
+    hotelCount: lodgingHotels.length,
+    hotels: lodgingHotels.map(function (h) {
+      return {
+        name: h.name || "",
+        formattedAddress: h.resolvedAddress || h.address || "",
+        checkInDate: h.checkInDate || "",
+        checkOutDate: h.checkOutDate || "",
+      };
+    }),
+    note: lodgingHotels.length > 1 ? "多酒店：按入住/离店日期分段闭环" : (lodging ? "全程固定酒店，每日往返" : ""),
+  };
+
+  var lodgingValidation = agentPlanner.validateLodging(lodging, totalDays);
+  var lodgingWarnings = closure.warnings.concat(lodgingValidation.errors, lodgingValidation.warnings);
+
+  requestTracer.emit({
+    stage: "incremental_replan",
+    eventType: "incremental_replan",
+    status: "ok",
+    payload: {
+      changeType: replanResult.changeType,
+      affectedScope: replanResult.affectedDays,
+      reusedRatio: replanResult.reusedRatio,
+      dayCount: replanResult.dayCount,
+    },
+  });
+  tracer.recordTrace(requestTracer);
+
+  return {
+    planData: replanResult.planData,
+    dailyPlans: newDailyPlans,
+    recommendedOrder: recommendedOrder,
+    affectedDays: replanResult.affectedDays,
+    reusedRatio: replanResult.reusedRatio,
+    changeType: replanResult.changeType,
+    routeMetrics: {
+      totalTravelMin: effectiveMetrics.totalTravelMin,
+      crossCityCount: effectiveMetrics.crossCityCount,
+      backtrackCount: effectiveMetrics.backtrackCount,
+      crossCityWithinDay: dailyMetrics.totalCrossCityWithinDay,
+      crossCityByDay: dailyMetrics.crossCityByDay,
+    },
+    lodgingSummary: lodgingSummary,
+    validation: {
+      pass: verifyResult.pass,
+      findings: verifyResult.findings,
+      lodgingWarnings: lodgingWarnings,
+    },
+    traceId: requestTracer.traceId,
+  };
+}
+
+async function handleAgentReplan(req, res) {
+  try {
+    var body = await readRequestBody(req);
+    var payload = buildAgentReplanPayload(body);
+    sendJson(res, 200, payload);
+  } catch (err) {
+    if (err && err.statusCode && err.payload) {
+      sendJson(res, err.statusCode, err.payload);
+      return;
+    }
+    sendJson(res, 500, { error: err.message });
+  }
+}
+
 function writeNdjson(res, payload) {
   res.write(JSON.stringify(payload) + "\n");
 }
@@ -2075,6 +2493,14 @@ var server = http.createServer(function (req, res) {
     }
     return;
   }
+  // v1.6 局部重算：改点后只重算受影响天（纯本地计算，不重新调用地图/LLM）。
+  if (req.method === "POST" && req.url === "/api/agent/replan") {
+    if (!enforceRateLimit(req, res)) {
+      return;
+    }
+    handleAgentReplan(req, res);
+    return;
+  }
   if (req.method === "GET") {
     serveStatic(req, res);
     return;
@@ -2093,4 +2519,7 @@ module.exports = {
   buildAgentPlanPayload: buildAgentPlanPayload,
   mapWithConcurrency: mapWithConcurrency,
   applyDefaultVisitDuration: applyDefaultVisitDuration,
+  estimateNaturalDaysAndSubset: estimateNaturalDaysAndSubset,
+  makeHybridLegMin: makeHybridLegMin,
+  haversineTravelMin: haversineTravelMin,
 };

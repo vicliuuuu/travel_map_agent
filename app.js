@@ -24,6 +24,8 @@
     layoutRoot: document.getElementById("mainLayout"),
     destinationsRoot: document.getElementById("destinationsRoot"),
     addCountryBtn: document.getElementById("addCountryBtn"),
+    hotelsList: document.getElementById("hotelsList"),
+    addHotelBtn: document.getElementById("addHotelBtn"),
     apiKeyInput: document.getElementById("apiKeyInput"),
     connectMapBtn: document.getElementById("connectMapBtn"),
     markMapBtn: document.getElementById("markMapBtn"),
@@ -316,18 +318,16 @@
     }
   }
 
-  function createPlaceRow(nameValue, addressValue, placeTypeValue) {
+  function createPlaceRow(nameValue, addressValue) {
     var row = document.createElement("div");
     row.className = "places-grid-row place-row";
     row.innerHTML =
       "<span class=\"col-index place-row-index\"></span>" +
       "<input type=\"text\" class=\"place-name-input\" placeholder=\"点位名称\" />" +
       "<input type=\"text\" class=\"place-address-input\" placeholder=\"详细地址（可选）\" />" +
-      "<select class=\"place-type-select\"><option value=\"scenic\">景点</option><option value=\"hotel\">酒店</option></select>" +
       "<button type=\"button\" class=\"btn-icon btn-remove-place\">×</button>";
     row.querySelector(".place-name-input").value = nameValue || "";
     row.querySelector(".place-address-input").value = addressValue || "";
-    row.querySelector(".place-type-select").value = placeTypeValue === "hotel" ? "hotel" : "scenic";
     return row;
   }
 
@@ -341,7 +341,7 @@
       "</div>" +
       "<div class=\"places-grid\">" +
       "<div class=\"places-grid-header\">" +
-      "<span class=\"col-index\">#</span><span class=\"col-name\">点位名</span><span class=\"col-address\">地址（可选）</span><span class=\"col-type\">酒店锚点</span><span class=\"col-action\"></span>" +
+      "<span class=\"col-index\">#</span><span class=\"col-name\">点位名</span><span class=\"col-address\">地址（可选）</span><span class=\"col-action\"></span>" +
       "</div>" +
       "<div class=\"city-places-grid-body\"></div>" +
       "</div>" +
@@ -371,16 +371,71 @@
     });
   }
 
-  function addPlaceRowToCity(cityBlock, nameValue, addressValue, placeTypeValue) {
+  function addPlaceRowToCity(cityBlock, nameValue, addressValue) {
     var body = cityBlock.querySelector(".city-places-grid-body");
-    body.appendChild(createPlaceRow(nameValue, addressValue, placeTypeValue));
+    body.appendChild(createPlaceRow(nameValue, addressValue));
     refreshPlaceIndexesWithinCity(cityBlock);
   }
 
   function addCityToCountry(countryBlock, cityValue) {
     var city = createCityBlock(cityValue);
     countryBlock.querySelector(".country-cities").appendChild(city);
-    addPlaceRowToCity(city, "", "", false);
+    addPlaceRowToCity(city, "", "");
+  }
+
+  // v1.6 多酒店：住宿区块行（名称 + 地址 + 入住/离店日期）。
+  function createHotelRow(hotel) {
+    var data = hotel || {};
+    var row = document.createElement("div");
+    row.className = "hotel-row";
+    row.innerHTML =
+      "<input type=\"text\" class=\"hotel-name-input\" placeholder=\"酒店名称\" />" +
+      "<input type=\"text\" class=\"hotel-address-input\" placeholder=\"酒店地址（可选）\" />" +
+      "<label class=\"hotel-date-label\">入住<input type=\"date\" class=\"hotel-checkin-input\" /></label>" +
+      "<label class=\"hotel-date-label\">离店<input type=\"date\" class=\"hotel-checkout-input\" /></label>" +
+      "<button type=\"button\" class=\"btn-icon btn-remove-hotel\">×</button>";
+    row.querySelector(".hotel-name-input").value = data.name || "";
+    row.querySelector(".hotel-address-input").value = data.address || "";
+    row.querySelector(".hotel-checkin-input").value = data.checkInDate || "";
+    row.querySelector(".hotel-checkout-input").value = data.checkOutDate || "";
+    return row;
+  }
+
+  function addHotelRow(hotel) {
+    if (!ui.hotelsList) {
+      return;
+    }
+    ui.hotelsList.appendChild(createHotelRow(hotel));
+  }
+
+  function collectHotelsFromUI() {
+    if (!ui.hotelsList) {
+      return [];
+    }
+    var rows = ui.hotelsList.querySelectorAll(".hotel-row");
+    return Array.prototype.map.call(rows, function (row) {
+      return {
+        name: row.querySelector(".hotel-name-input").value.trim(),
+        address: row.querySelector(".hotel-address-input").value.trim(),
+        checkInDate: row.querySelector(".hotel-checkin-input").value.trim(),
+        checkOutDate: row.querySelector(".hotel-checkout-input").value.trim(),
+      };
+    }).filter(function (hotel) {
+      return hotel.name || hotel.address;
+    });
+  }
+
+  // v1.6：由住宿区块构建 lodging（mode single/multi）；无酒店返回 null（全程无酒店闭环）。
+  function buildLodgingFromHotels(hotels) {
+    var list = Array.isArray(hotels) ? hotels : [];
+    if (!list.length) {
+      return null;
+    }
+    return {
+      mode: list.length > 1 ? "multi" : "single",
+      hotel: list[0],
+      hotels: list,
+    };
   }
 
   function addCountry(countryValue) {
@@ -398,12 +453,9 @@
         var city = cityBlock.querySelector(".city-input").value.trim();
         var rows = cityBlock.querySelectorAll(".place-row");
         var places = Array.prototype.map.call(rows, function (row) {
-          var placeType = row.querySelector(".place-type-select").value === "hotel" ? "hotel" : "scenic";
           return {
             name: row.querySelector(".place-name-input").value.trim(),
             address: row.querySelector(".place-address-input").value.trim(),
-            isHotel: placeType === "hotel",
-            type: placeType,
           };
         }).filter(function (place) {
           return place.name || place.address;
@@ -424,46 +476,18 @@
     });
   }
 
-  function splitLodgingFromPlaces(flatPlaces) {
-    var places = Array.isArray(flatPlaces) ? flatPlaces : [];
-    var hotelCandidate = null;
-    var nonHotelPlaces = [];
-    places.forEach(function (place) {
-      if (place.isHotel && !hotelCandidate) {
-        hotelCandidate = place;
-        return;
-      }
-      nonHotelPlaces.push(place);
-    });
-    var lodging = null;
-    if (hotelCandidate) {
-      lodging = {
-        mode: "single",
-        hotel: {
-          name: hotelCandidate.name || "酒店",
-          address: hotelCandidate.addressExtra || hotelCandidate.address || "",
-          checkInDate: "",
-          checkOutDate: "",
-        },
-      };
-    }
-    return {
-      lodging: lodging,
-      places: nonHotelPlaces,
-    };
-  }
-
   function collectAllTripInput() {
     var destinations = collectDestinationsFromUI();
     var flatPlaces = window.TravelPlanner.flattenDestinations(destinations);
-    var splitResult = splitLodgingFromPlaces(flatPlaces);
     var primary = primaryDestination(destinations);
+    // v1.6：酒店改由独立住宿区块收集，景点列表不再承载酒店。
+    var lodging = buildLodgingFromHotels(collectHotelsFromUI());
     return {
       destinations: destinations,
-      places: mergePlacesWithLlmInsights(splitResult.places),
+      places: mergePlacesWithLlmInsights(flatPlaces),
       country: primary.country,
       city: primary.city,
-      lodging: splitResult.lodging,
+      lodging: lodging,
       totalDays: Number(ui.daysInput.value),
       visitMinutes: Number(ui.visitMinutesInput.value),
       strategy: ui.strategySelect ? ui.strategySelect.value : "fastest",
@@ -574,33 +598,46 @@
     return resolved;
   }
 
-  async function resolveHotelForMap(lodging, fallbackCountry, fallbackCity) {
-    if (!lodging || !lodging.hotel) {
-      return null;
+  // v1.6 多酒店：解析全部酒店坐标（兼容旧的单 lodging.hotel）。单家标点失败不中断其余。
+  async function resolveHotelsForMap(lodging, fallbackCountry, fallbackCity) {
+    var hotels = (lodging && Array.isArray(lodging.hotels) && lodging.hotels.length)
+      ? lodging.hotels
+      : ((lodging && lodging.hotel) ? [lodging.hotel] : []);
+    var multi = hotels.length > 1;
+    var resolved = [];
+    var i;
+    for (i = 0; i < hotels.length; i += 1) {
+      var hotel = hotels[i] || {};
+      var hotelName = String(hotel.name || "").trim();
+      var hotelAddress = String(hotel.address || hotel.resolvedAddress || "").trim();
+      if (!hotelName && !hotelAddress) {
+        continue;
+      }
+      var query = window.TravelPlanner.buildGeocodeQuery(
+        {
+          name: hotelName || "酒店",
+          addressExtra: hotelAddress,
+        },
+        fallbackCountry || "",
+        fallbackCity || ""
+      );
+      var countryCode = window.TravelLocationData
+        ? window.TravelLocationData.getCountryCodeFromInput(fallbackCountry || "")
+        : "";
+      try {
+        var geo = await geocodePlace(query, countryCode);
+        resolved.push({
+          title: hotelName || "酒店",
+          formattedAddress: geo.formattedAddress,
+          latLng: geo.latLng,
+          label: multi ? ("H" + (i + 1)) : "H",
+        });
+      } catch (err) {
+        // 无静默失败：记录单家酒店标点失败，但不中断其余酒店/景点标点
+        console.warn("[map] 酒店标点失败: " + (hotelName || query) + " - " + (err && err.message));
+      }
     }
-    var hotel = lodging.hotel;
-    var hotelName = String(hotel.name || "").trim();
-    var hotelAddress = String(hotel.address || "").trim();
-    if (!hotelName && !hotelAddress) {
-      return null;
-    }
-    var query = window.TravelPlanner.buildGeocodeQuery(
-      {
-        name: hotelName || "酒店",
-        addressExtra: hotelAddress,
-      },
-      fallbackCountry || "",
-      fallbackCity || ""
-    );
-    var countryCode = window.TravelLocationData
-      ? window.TravelLocationData.getCountryCodeFromInput(fallbackCountry || "")
-      : "";
-    var geo = await geocodePlace(query, countryCode);
-    return {
-      title: hotelName || "酒店",
-      formattedAddress: geo.formattedAddress,
-      latLng: geo.latLng,
-    };
+    return resolved;
   }
 
   function placeHotelMarker(hotelInfo) {
@@ -611,7 +648,7 @@
       map: state.map,
       position: hotelInfo.latLng,
       label: {
-        text: "H",
+        text: hotelInfo.label || "H",
         color: "#ffffff",
         fontWeight: "700",
       },
@@ -646,9 +683,11 @@
     try {
       var resolvedStops = await resolvePlacesForMap(places);
       var primary = primaryDestination(destinations);
-      var hotelStop = await resolveHotelForMap(tripInput.lodging, primary.country, primary.city);
+      var hotelStops = await resolveHotelsForMap(tripInput.lodging, primary.country, primary.city);
       clearRouteOverlays();
-      placeHotelMarker(hotelStop);
+      hotelStops.forEach(function (hotelStop) {
+        placeHotelMarker(hotelStop);
+      });
 
       resolvedStops.forEach(function (stop, index) {
         if (stop.sourcePlace) {
@@ -676,21 +715,22 @@
       state.places = places;
       renderPlacesList();
 
-      if (resolvedStops.length === 1 && !hotelStop) {
+      if (resolvedStops.length === 1 && !hotelStops.length) {
         state.map.setCenter(resolvedStops[0].latLng);
         state.map.setZoom(14);
       } else {
         var bounds = new google.maps.LatLngBounds();
-        if (hotelStop) {
+        hotelStops.forEach(function (hotelStop) {
           bounds.extend(hotelStop.latLng);
-        }
+        });
         resolvedStops.forEach(function (stop) {
           bounds.extend(stop.latLng);
         });
         state.map.fitBounds(bounds);
       }
 
-      updateStatus("已在地图上按顺序标点（共 " + resolvedStops.length + " 个）" + (hotelStop ? "，并标记酒店 H 点" : "") + "。", false);
+      updateStatus("已在地图上按顺序标点（共 " + resolvedStops.length + " 个）" +
+        (hotelStops.length ? ("，并标记 " + hotelStops.length + " 家酒店（H）") : "") + "。", false);
       setLayoutMode("map");
     } catch (err) {
       updateStatus("地图标点失败: " + err.message, true);
@@ -757,22 +797,37 @@
     }
 
     clearRouteOverlays();
-    if (lodgingSummary && (lodgingSummary.formattedAddress || lodgingSummary.hotelName)) {
-      var hotelQuery = String(lodgingSummary.formattedAddress || lodgingSummary.hotelName || "");
-      if (hotelQuery) {
-        try {
-          var hotelCountryCode = window.TravelLocationData
-            ? window.TravelLocationData.getCountryCodeFromInput(country || "")
-            : "";
-          var hotelGeo = await geocodePlace(hotelQuery, hotelCountryCode);
-          placeHotelMarker({
-            title: lodgingSummary.hotelName || "酒店",
-            formattedAddress: hotelGeo.formattedAddress,
-            latLng: hotelGeo.latLng,
-          });
-        } catch (err) {
-          // ignore hotel marker failure
+    // v1.6 多酒店：逐家标点（此前只标了第一家 / 主酒店）。兼容旧的单酒店 lodgingSummary。
+    var hotelList = (lodgingSummary && Array.isArray(lodgingSummary.hotels) && lodgingSummary.hotels.length)
+      ? lodgingSummary.hotels
+      : ((lodgingSummary && (lodgingSummary.formattedAddress || lodgingSummary.hotelName))
+          ? [{ name: lodgingSummary.hotelName, formattedAddress: lodgingSummary.formattedAddress }]
+          : []);
+    var multiHotel = hotelList.length > 1;
+    var hotelLatLngs = [];
+    for (i = 0; i < hotelList.length; i += 1) {
+      var hotel = hotelList[i];
+      var hotelQuery = String((hotel && (hotel.formattedAddress || hotel.name)) || "");
+      if (!hotelQuery) {
+        continue;
+      }
+      try {
+        var hotelCountryCode = window.TravelLocationData
+          ? window.TravelLocationData.getCountryCodeFromInput(country || "")
+          : "";
+        var hotelGeo = await geocodePlace(hotelQuery, hotelCountryCode);
+        placeHotelMarker({
+          title: (hotel && hotel.name) || "酒店",
+          formattedAddress: hotelGeo.formattedAddress,
+          latLng: hotelGeo.latLng,
+          label: multiHotel ? ("H" + (i + 1)) : "H",
+        });
+        if (hotelGeo.latLng) {
+          hotelLatLngs.push(hotelGeo.latLng);
         }
+      } catch (err) {
+        // 无静默失败：记录酒店标点失败，但不中断整体路线渲染（best-effort 标记）
+        console.warn("[map] 酒店标点失败: " + ((hotel && hotel.name) || hotelQuery) + " - " + (err && err.message));
       }
     }
 
@@ -818,6 +873,10 @@
     var bounds = new google.maps.LatLngBounds();
     resolvedStops.forEach(function (stop) {
       bounds.extend(stop.latLng);
+    });
+    // 多酒店可能分布较散，把酒店点也纳入视野，避免只框住景点导致酒店标记出界。
+    hotelLatLngs.forEach(function (latLng) {
+      bounds.extend(latLng);
     });
     state.map.fitBounds(bounds);
     updateStatus("智能规划完成，路线已展示（可切换自驾/公交）。", false);
@@ -1041,8 +1100,27 @@
       "</div>";
   }
 
-  function renderDayCards(dailyPlans) {
-    return (Array.isArray(dailyPlans) ? dailyPlans : []).map(function (dayPlan) {
+  // v1.6 局部重算：每个景点的「删除 / 移到第 N 天」控件（仅主方案可编辑）。
+  function renderReplanControls(placeName, currentDay, allDays) {
+    var others = (Array.isArray(allDays) ? allDays : []).filter(function (d) {
+      return Number(d) !== Number(currentDay);
+    });
+    var options = "<option value=\"\">移到第…天</option>" + others.map(function (d) {
+      return "<option value=\"" + d + "\">移到第 " + d + " 天</option>";
+    }).join("");
+    var moveSelect = others.length
+      ? ("<select class=\"replan-move-select\" data-place=\"" + escapeHtml(placeName) + "\" data-day=\"" + currentDay + "\">" + options + "</select>")
+      : "";
+    return "<div class=\"station-actions\">" +
+      "<button type=\"button\" class=\"btn-replan-remove\" data-place=\"" + escapeHtml(placeName) + "\">删除此点</button>" +
+      moveSelect +
+      "</div>";
+  }
+
+  function renderDayCards(dailyPlans, editable) {
+    var plans = Array.isArray(dailyPlans) ? dailyPlans : [];
+    var allDays = plans.map(function (d) { return Number(d.day); });
+    return plans.map(function (dayPlan) {
       var stationNo = 0;
       var body = (Array.isArray(dayPlan.segments) ? dayPlan.segments : []).map(function (segment) {
         if (segment.type === "visit") {
@@ -1051,6 +1129,7 @@
             "<h5>第 " + stationNo + " 站 · " + escapeHtml(segment.placeName) + "</h5>" +
             (segment.visitTimeRange ? ("<p class=\"station-meta\">游玩：" + escapeHtml(segment.visitTimeRange) + "</p>") : "") +
             renderOpeningHours(segment.openingHours) +
+            (editable ? renderReplanControls(segment.placeName, dayPlan.day, allDays) : "") +
             "</article>";
         }
         return renderTransitConnector(segment);
@@ -1060,6 +1139,86 @@
         body +
         "</div>";
     }).join("");
+  }
+
+  // v1.6 局部重算：把改点事件发到 /api/agent/replan，只重算受影响天，合并结果后重渲染 + 重绘地图。
+  async function performReplan(changeEvent) {
+    var ctx = state.lastPlanContext;
+    var agentResult = state.lastAgentResult;
+    if (!ctx || !agentResult) {
+      updateStatus("暂无可重算的行程，请先生成路书。", true);
+      return;
+    }
+    updateStatus("正在局部重算…", false);
+    try {
+      var resp = await fetch("/api/agent/replan", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          planData: agentResult.planData,
+          dailyPlans: agentResult.dailyPlans,
+          enrichedPlaces: Array.isArray(agentResult.enrichedPlaces) ? agentResult.enrichedPlaces : state.places,
+          lodging: ctx.lodging,
+          totalDays: (Array.isArray(agentResult.dailyPlans) ? agentResult.dailyPlans : []).length,
+          strategy: ctx.strategy,
+          transportPreference: ctx.transportPreference,
+          physicalPreference: ctx.physicalPreference,
+          changeEvent: changeEvent,
+        }),
+      });
+      if (!resp.ok) {
+        var errText = await resp.text();
+        throw new Error("局部重算失败(" + resp.status + "): " + errText);
+      }
+      var data = await resp.json();
+      agentResult.planData = data.planData;
+      agentResult.dailyPlans = data.dailyPlans;
+      agentResult.recommendedOrder = data.recommendedOrder;
+      agentResult.routeMetrics = data.routeMetrics;
+      if (data.lodgingSummary) {
+        agentResult.lodgingSummary = data.lodgingSummary;
+      }
+      if (agentResult.validation && data.validation) {
+        agentResult.validation.findings = data.validation.findings;
+        agentResult.validation.lodgingWarnings = data.validation.lodgingWarnings;
+      }
+      agentResult.replanInfo = {
+        affectedDays: data.affectedDays,
+        reusedRatio: data.reusedRatio,
+        changeType: data.changeType,
+      };
+      renderAgentRoadbook(agentResult, ctx.country, ctx.city);
+      if (state.mapReady) {
+        await renderRouteOnMap(data.planData, ctx.country, ctx.city, agentResult.lodgingSummary || null);
+      }
+      var pct = Math.round((Number(data.reusedRatio) || 0) * 100);
+      updateStatus("已局部重算：仅重算第 " + (data.affectedDays || []).join("、") + " 天，复用 " + pct + "%。", false);
+    } catch (err) {
+      updateStatus("局部重算失败：" + err.message, true);
+    }
+  }
+
+  function handleRoadbookClick(evt) {
+    var removeBtn = evt.target.closest ? evt.target.closest(".btn-replan-remove") : null;
+    if (removeBtn) {
+      var name = removeBtn.getAttribute("data-place") || "";
+      if (name && window.confirm("确定删除「" + name + "」？将只重算它所在的那一天。")) {
+        performReplan({ type: "remove_place", placeName: name });
+      }
+    }
+  }
+
+  function handleRoadbookChange(evt) {
+    var select = evt.target;
+    if (!select || !select.classList || !select.classList.contains("replan-move-select")) {
+      return;
+    }
+    var toDay = Number(select.value);
+    var name = select.getAttribute("data-place") || "";
+    if (name && Number.isFinite(toDay) && toDay > 0) {
+      performReplan({ type: "move_place", placeName: name, toDay: toDay });
+    }
+    select.value = "";
   }
 
   function renderAgentRoadbook(agentResult, country, city) {
@@ -1114,6 +1273,19 @@
       );
     }
 
+    // v1.6 局部重算回执：展示本次仅重算了哪几天、复用率。
+    var replanInfo = agentResult.replanInfo;
+    if (replanInfo && Array.isArray(replanInfo.affectedDays)) {
+      var pct = Math.round((Number(replanInfo.reusedRatio) || 0) * 100);
+      var changeLabel = replanInfo.changeType === "move_place" ? "移动景点" : (replanInfo.changeType === "remove_place" ? "删除景点" : "改点");
+      sections.push(
+        "<section class=\"roadbook-section roadbook-replan-info\">" +
+        "<p>🔁 局部重算（" + escapeHtml(changeLabel) + "）：本次仅重算第 " +
+        escapeHtml(replanInfo.affectedDays.join("、")) + " 天，其余 " + pct + "% 的行程原样复用。</p>" +
+        "</section>"
+      );
+    }
+
     var spotlights = Array.isArray(agentResult.placeSpotlights) ? agentResult.placeSpotlights : [];
     if (spotlights.length) {
       var spotlightHtml = spotlights.map(function (item, index) {
@@ -1145,7 +1317,8 @@
       sections.push(
         "<section class=\"roadbook-section\">" +
         "<h3>按日行程（酒店闭环）" + primaryLabel + "</h3>" +
-        renderDayCards(dailyPlans) +
+        "<p class=\"tips replan-hint\">可对任一景点「删除此点」或「移到第 N 天」，系统只会重算受影响的天（局部重算，不重新调用地图/LLM）。</p>" +
+        renderDayCards(dailyPlans, true) +
         "</section>"
       );
     }
@@ -1158,7 +1331,7 @@
         "<section class=\"roadbook-section roadbook-alt\">" +
         "<h3>" + escapeHtml(altPlan.label || "备选方案") + "</h3>" +
         "<p class=\"overview-facts\">" + escapeHtml(buildFactLine(altPlan.days, altPlaceCount, altPlan.routeMetrics, agentResult.strategyLabel)) + "</p>" +
-        renderDayCards(altPlan.dailyPlans) +
+        renderDayCards(altPlan.dailyPlans, false) +
         "</section>"
       );
     }
@@ -1489,6 +1662,16 @@
       updatePlanProgress(100, "路书生成完成");
       var planData = Array.isArray(data.planData) ? data.planData : [];
       state.places = Array.isArray(data.enrichedPlaces) ? data.enrichedPlaces : places;
+      // v1.6 局部重算所需的上下文：保存最近一次规划结果与请求参数，改点时无需重新走整条链路。
+      state.lastAgentResult = data;
+      state.lastPlanContext = {
+        country: country,
+        city: city,
+        lodging: tripInput.lodging,
+        strategy: strategy,
+        transportPreference: transportPreference,
+        physicalPreference: physicalPreference,
+      };
       renderPlacesList();
       renderAgentRoadbook(data, country, city);
       if (state.mapReady) {
@@ -1566,6 +1749,21 @@
     ui.addCountryBtn.addEventListener("click", function () {
       addCountry("");
     });
+    if (ui.addHotelBtn) {
+      ui.addHotelBtn.addEventListener("click", function () {
+        addHotelRow(null);
+      });
+    }
+    if (ui.hotelsList) {
+      ui.hotelsList.addEventListener("click", function (event) {
+        if (event.target.classList.contains("btn-remove-hotel")) {
+          var hotelRow = event.target.closest(".hotel-row");
+          if (hotelRow) {
+            hotelRow.remove();
+          }
+        }
+      });
+    }
     ui.markMapBtn.addEventListener("click", function () {
       markOrderedPlacesOnMap();
     });
@@ -1579,6 +1777,9 @@
     ui.agentPlanBtn.addEventListener("click", function () {
       agentPlanWithTools();
     });
+    // v1.6 局部重算：路书区内景点的删除/移天控件走事件委托。
+    ui.itineraryResult.addEventListener("click", handleRoadbookClick);
+    ui.itineraryResult.addEventListener("change", handleRoadbookChange);
     ui.destinationsRoot.addEventListener("click", function (event) {
       var target = event.target;
       if (target.classList.contains("btn-add-city")) {
@@ -1602,7 +1803,7 @@
       }
       if (target.classList.contains("btn-add-place")) {
         var cityBlock = target.closest(".destination-city");
-        addPlaceRowToCity(cityBlock, "", "", false);
+        addPlaceRowToCity(cityBlock, "", "");
         refreshPlacesPreview();
         return;
       }
@@ -1715,7 +1916,13 @@
     refreshPlacesPreview();
   }
 
+  function initHotels() {
+    // 起始给一行空酒店，便于发现（可选：留空则全程无酒店闭环）。
+    addHotelRow(null);
+  }
+
   initDestinations();
+  initHotels();
   resetItineraryPanel();
   refreshPlacesPreview();
   setLayoutMode("input");

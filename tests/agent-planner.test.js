@@ -83,6 +83,75 @@ test("buildPlanDataFromOrder splits unevenly with remainder front-loaded", () =>
   );
 });
 
+// v1.6 按城市软对齐分天
+test("buildPlanDataFromOrder aligns days to city boundaries (days == cities)", () => {
+  const names = ["小美人鱼", "市政厅", "国家博物馆", "马尔默竞技场", "利姆港", "Mobilia", "恶心博物馆"];
+  const places = names.map((n) => ({ name: n }));
+  const cityByName = {
+    小美人鱼: "哥本哈根", 市政厅: "哥本哈根", 国家博物馆: "哥本哈根",
+    马尔默竞技场: "马尔默", 利姆港: "马尔默", Mobilia: "马尔默", 恶心博物馆: "马尔默",
+  };
+  const planData = agentPlanner.buildPlanDataFromOrder(names, places, "", 2, {
+    cityOf: (n) => cityByName[n] || "",
+  });
+  assert.equal(planData.length, 2);
+  assert.deepEqual(planData[0].items.map((i) => i.title), ["小美人鱼", "市政厅", "国家博物馆"]);
+  assert.deepEqual(planData[1].items.map((i) => i.title), ["马尔默竞技场", "利姆港", "Mobilia", "恶心博物馆"]);
+});
+
+test("buildPlanDataFromOrder gives extra day to busiest city (days > cities)", () => {
+  const places = ["A", "B", "C", "D"].map((n) => ({ name: n }));
+  const cityByName = { A: "CPH", B: "CPH", C: "CPH", D: "MAL" };
+  const planData = agentPlanner.buildPlanDataFromOrder(["A", "B", "C", "D"], places, "", 3, {
+    cityOf: (n) => cityByName[n],
+  });
+  assert.equal(planData.length, 3);
+  // CPH(3) 最拥挤 → 拿 2 天，连续切 2+1；MAL(1) 独占 1 天。
+  assert.deepEqual(planData[0].items.map((i) => i.title), ["A", "B"]);
+  assert.deepEqual(planData[1].items.map((i) => i.title), ["C"]);
+  assert.deepEqual(planData[2].items.map((i) => i.title), ["D"]);
+});
+
+test("buildPlanDataFromOrder merges smallest adjacent cities (days < cities)", () => {
+  const places = ["X1", "Y1", "Z1", "Z2", "Z3"].map((n) => ({ name: n }));
+  const cityByName = { X1: "X", Y1: "Y", Z1: "Z", Z2: "Z", Z3: "Z" };
+  const planData = agentPlanner.buildPlanDataFromOrder(["X1", "Y1", "Z1", "Z2", "Z3"], places, "", 2, {
+    cityOf: (n) => cityByName[n],
+  });
+  assert.equal(planData.length, 2);
+  // runs: X(1),Y(1),Z(3)；days=2 → 合并相邻点数之和最小的一对（X+Y）→ [X1,Y1] 与 [Z1,Z2,Z3]。
+  assert.deepEqual(planData[0].items.map((i) => i.title), ["X1", "Y1"]);
+  assert.deepEqual(planData[1].items.map((i) => i.title), ["Z1", "Z2", "Z3"]);
+});
+
+test("buildPlanDataFromOrder without cityOf keeps legacy contiguous split", () => {
+  const places = ["A", "B", "C", "D", "E"].map((n) => ({ name: n }));
+  const planData = agentPlanner.buildPlanDataFromOrder(["A", "B", "C", "D", "E"], places, "City", 2);
+  assert.deepEqual(planData[0].items.map((i) => i.title), ["A", "B", "C"]);
+  assert.deepEqual(planData[1].items.map((i) => i.title), ["D", "E"]);
+});
+
+// v1.6 体力衰减
+test("fatigueAdjustedVisitMin applies increasing decay (rate 0.1)", () => {
+  assert.equal(agentPlanner.fatigueAdjustedVisitMin([100, 100, 100], 0.1), 330);
+  assert.equal(agentPlanner.fatigueAdjustedVisitMin([120], 0.1), 120);
+  assert.equal(agentPlanner.fatigueAdjustedVisitMin([], 0.1), 0);
+});
+
+test("evaluateTimeFeasibility counts fatigue in daily minutes", () => {
+  const res = agentPlanner.evaluateTimeFeasibility(
+    [{ day: 1, segments: [
+      { type: "visit", visitDurationMin: 200 },
+      { type: "visit", visitDurationMin: 200 },
+      { type: "visit", visitDurationMin: 200 },
+    ] }],
+    1
+  );
+  // 200 + 220 + 240 = 660（含 0.1 疲劳），超过 600 预算 → 过载。
+  assert.equal(res.feasible, false);
+  assert.equal(res.overloadedDays[0].estimatedMinutes, 660);
+});
+
 test("buildDailyPlansFromRoadbook adds hotel round-trip segments", () => {
   const dailyPlans = agentPlanner.buildDailyPlansFromRoadbook(
     [

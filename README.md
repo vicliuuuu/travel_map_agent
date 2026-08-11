@@ -1,8 +1,8 @@
 # 旅行规划 Agent
 
-当前版本：**内测 v1.5.4**（详见 [`doc_auto/内测-v1.5-前瞻规划.md`](doc_auto/内测-v1.5-前瞻规划.md) 与 [`doc_auto/changes.md`](doc_auto/changes.md)）
+当前版本：**内测 v1.6.0**（详见 [`doc_auto/内测-v1.6-前瞻规划.md`](doc_auto/内测-v1.6-前瞻规划.md) 与 [`doc_auto/changes.md`](doc_auto/changes.md)）
 
-可本地运行、也可公网部署的旅行路线规划原型：支持多目的地层级输入、酒店锚点、地图标点与 Agent 智能路书；v1.2 引入策略引擎、跨城公共交通分段与酒店闭环硬约束，v1.3 把隐式流程升级为「显式状态机 + 自动修复闭环」并建立全链路 trace 埋点基线，v1.4 升级为「策略引擎（多策略打分 + 候选剪枝 + 打分兜底）」并根治 OI-1 跨城分天，v1.5 把工具层扩展为「可插拔多事实源」（营业时间/天气/拥堵）并把校验层扩展到「闭馆风险/体力强度/回酒店往返成本」。
+可本地运行、也可公网部署的旅行路线规划原型：支持多目的地层级输入、酒店锚点、地图标点与 Agent 智能路书；v1.2 引入策略引擎、跨城公共交通分段与酒店闭环硬约束，v1.3 把隐式流程升级为「显式状态机 + 自动修复闭环」并建立全链路 trace 埋点基线，v1.4 升级为「策略引擎（多策略打分 + 候选剪枝 + 打分兜底）」并根治 OI-1 跨城分天，v1.5 把工具层扩展为「可插拔多事实源」（营业时间/天气/拥堵）并把校验层扩展到「闭馆风险/体力强度/回酒店往返成本」，v1.6 把景点与酒店分离输入并支持「多酒店/换酒店按日闭环」、支持「局部重算（改一个点只重算受影响天）」、并把天数估算重做为「逐日装箱 + 单日预算随体力强度联动」。
 
 ## 两种使用模式
 
@@ -14,8 +14,8 @@
 ## 功能概览
 
 - **层级输入**：国家/城市/点位三级结构，支持动态添加与删除
-- **点位类型**：每行可选景点/酒店，默认景点，酒店作为可选锚点
-- **地图标点**：无 LLM 时的核心能力，修复了多景点重叠到城市中心的问题
+- **景点/酒店分离输入（v1.6）**：景点列表只填景点；酒店独立管理，可填多家并各带入住/离店日期（酒店仍为可选，保护隐私）
+- **地图标点**：无 LLM 时的核心能力，修复了多景点重叠到城市中心的问题；多酒店时逐家标记（H1/H2…）
 - **Agent 智能路书**：LLM + Google Maps 工具（地理编码、真实车程）
 - **策略引擎（v1.2）**：省时优先 / 少换乘优先 / 经典打卡优先，后端打分器在模型建议与策略候选中择优并解释
 - **跨城公共交通分段（v1.2）**：对跨城相邻段调用 Google Directions `transit`，输出步行/轨交/换乘分段时长，替代“请以实时导航为准”
@@ -32,6 +32,10 @@
 - **校验层扩展（v1.5）**：`OPENING_RISK`（时间轴推算到达时刻判闭馆，未核实降级 warn）/`PHYSICAL_OVERLOAD`（单日体力强度）/`HOTEL_RETURN_COST`（回酒店往返成本），闭馆风险联动 `advance_place` 修复动作
 - **来源标注与降级（v1.5）**：外部事实统一带 `source/fetchedAt/verifyState`，工具不可用时 skip/conservative/fatal 分级降级（不静默），trace schema 升至 1.5.0（新增 fact_source / tool_degrade）
 - **全链路审计修复（v1.5.2+）**：外部事实工具并发化 + 超时放宽（压延迟/防限流）、用户级 `visitMinutes` 时长兜底生效、交付前重打分使策略解释与展示指标同源、缺城市元数据不再虚增跨城计数
+- **多酒店 / 换酒店按日闭环（v1.6）**：可填多家酒店（各带入住/离店日期），按日期映射每天所属酒店；换酒店日在当天首段插入「行李转移」腿，空档日退化为无酒店闭环并提醒；`lodgingSummary` 输出全部酒店，地图逐家标记
+- **局部重算 Incremental Replan（v1.6）**：按日行程中「删除某点 / 移到第 N 天」只重算受影响天，未受影响天逐字节复用，纯本地重算（不重调 LLM/地图 API），回执显示「仅重算第 X 天、复用 Y%」；后端 `POST /api/agent/replan`
+- **天数估算重做 + 体力强度联动（v1.6）**：从「单链平均通勤/写死 10h」改为「逐日装箱取最小可行天数」——每天须同时满足纯游玩（含 0.1 疲劳、每天重置）≤ 体力档位上限、景点数 ≤ 上限、且「游玩+通勤+当天酒店往返」≤ **随体力强度缩放的单日预算（轻松 8h / 标准 10h / 硬核 12h）× 85% 冗余**；通勤走混合口径（真实车程缓存优先 + 坐标 haversine 兜底，零额外 API）。体力强度自此真正影响「该排几天」
+- **按城市软对齐分天（v1.6）**：分天切在城市边界上（一天尽量一城），天数不足时合并「点数之和最小」的相邻城市段，避免把同城拆两天/无谓跨城
 - **智能路书展示**：概述、路线策略、住宿摘要、按日路书、校验结果与替代方案
 - **LLM 供应商识别**：默认 DashScope（Qwen），兼容 OpenAI 等
 - **公网部署（v1.2）**：Docker/环境变量/CORS/限流，密钥可后端环境变量兜底（详见 [`deploy.md`](deploy.md)）
@@ -48,7 +52,7 @@ node server.js
 
 3. **地图标点（无需 LLM）**
    - 填 Google Maps API Key → 连接地图
-   - 填层级目的地与点位（可选一个酒店锚点）→ 点击「在地图上标点」
+   - 填层级目的地与景点，并在「住宿」区可选填一家或多家酒店 → 点击「在地图上标点」
 
 4. **智能路书（需要 LLM）**
    - 完成上述配置
@@ -84,10 +88,10 @@ node server.js
 ## 测试
 
 ```bash
-node --test tests/planner.test.js tests/llm.test.js tests/agent-planner.test.js tests/location-data.test.js tests/verifier.test.js tests/repair.test.js tests/state-machine.test.js tests/tracer.test.js tests/day-plan.test.js tests/scoring.test.js tests/tools.test.js
+node --test tests/planner.test.js tests/llm.test.js tests/agent-planner.test.js tests/location-data.test.js tests/verifier.test.js tests/repair.test.js tests/state-machine.test.js tests/tracer.test.js tests/day-plan.test.js tests/scoring.test.js tests/tools.test.js tests/multi-hotel.test.js tests/replan.test.js tests/day-estimate.test.js
 ```
 
-或直接 `npm test`（已包含全部测试文件）。
+或直接 `npm test`（已包含全部测试文件，v1.6 全量 **159** 例）。
 
 ## v1.5 工具/校验开关（环境变量）
 
@@ -106,7 +110,7 @@ node --test tests/planner.test.js tests/llm.test.js tests/agent-planner.test.js 
 | `WEATHER_TIMEOUT_MS` | `6000` | 天气单次调用超时 |
 | `OPENING_HOURS_SCOPE` | `all` | `all`=全部景点查营业时间；`high`=仅高优先级景点（省调用/省钱） |
 
-请求体新增可选字段：`physicalPreference: easy \| standard \| hardcore`（默认 `standard`），对应单日体力强度阈值 5h/4景点、7h/6景点、9h/8景点；前端「体力强度偏好」下拉可选。`visitMinutes`（每个景点默认游玩时长，分钟）现已生效：仅对模型未给出建议时长的景点作兜底（clamp 30~480）。
+请求体新增可选字段：`physicalPreference: easy \| standard \| hardcore`（默认 `standard`），对应单日体力强度阈值 5h/4景点、7h/6景点、9h/8景点；前端「体力强度偏好」下拉可选。**v1.6 起该档位还决定单日总时长预算（轻松 8h / 标准 10h / 硬核 12h，另留 15% 时间冗余），直接影响天数估算与超载判定**——即体力强度真正影响「该排几天」，不再与写死的 10h 脱钩。`visitMinutes`（每个景点默认游玩时长，分钟）现已生效：仅对模型未给出建议时长的景点作兜底（clamp 30~480）。
 
 > 注意：`opening_hours` 需在 Google Cloud 启用 **Places API（经典版）**，`weather` 需启用 **Weather API**，并把它们加入该 key 的 API 限制允许列表。
 
@@ -122,4 +126,5 @@ node --test tests/planner.test.js tests/llm.test.js tests/agent-planner.test.js 
 - v1.3 规划与实现：[`doc_auto/内测-v1.3-前瞻规划.md`](doc_auto/内测-v1.3-前瞻规划.md)
 - v1.4 规划与实现：[`doc_auto/内测-v1.4-前瞻规划.md`](doc_auto/内测-v1.4-前瞻规划.md)
 - v1.5 规划与实现：[`doc_auto/内测-v1.5-前瞻规划.md`](doc_auto/内测-v1.5-前瞻规划.md)
+- v1.6 规划与实现：[`doc_auto/内测-v1.6-前瞻规划.md`](doc_auto/内测-v1.6-前瞻规划.md)
 - 变更记录：[`doc_auto/changes.md`](doc_auto/changes.md)
