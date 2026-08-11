@@ -156,15 +156,6 @@ function countryConflicts(declaredCountry, resolvedCountry) {
   return !isSameLoose(declaredCountry, resolvedCountry);
 }
 
-function cityNameDiffers(declaredCity, resolvedCity) {
-  var d = normalizeText(declaredCity);
-  var r = normalizeText(resolvedCity);
-  if (!d || !r) {
-    return false;
-  }
-  return !isSameLoose(declaredCity, resolvedCity);
-}
-
 function buildDefaultLodging(lodging) {
   if (!lodging || !lodging.hotel) {
     return null;
@@ -682,14 +673,14 @@ async function runToolCallingAgent(input, onProgress) {
 function buildValidationResult(analysis, toolContext, normalizedInput) {
   var placeList = normalizedInput.places || [];
   var excludedPlaces = [];
-  var cityNotes = [];
   placeList.forEach(function (place) {
     var resolved = toolContext.geocodeByName[normalizeText(place.name)] ||
       toolContext.geocodeByName[String(place.name || "").trim().toLowerCase()];
     if (!resolved) {
       return;
     }
-    // 只有「国家」明确冲突才排除；城市外来名/本地名差异（Copenhagen vs København）不再排除
+    // 只有「国家」明确冲突才排除；城市外来名/本地名差异（Copenhagen vs København）不再排除，
+    // 也不再产生「待核实」提醒（多为本地语言/别称，属噪音，已保留在行程中）。
     if (countryConflicts(place.declaredCountry, resolved.resolvedCountry)) {
       excludedPlaces.push({
         name: place.name,
@@ -699,19 +690,12 @@ function buildValidationResult(analysis, toolContext, normalizedInput) {
           (resolved.resolvedCountry || "未知") + " ≠ " + (place.declaredCountry || "未填") + "）",
         resolvedAddress: resolved.formattedAddress || "",
       });
-      return;
-    }
-    if (cityNameDiffers(place.declaredCity, resolved.resolvedCity)) {
-      cityNotes.push(
-        place.name + "：声明城市「" + place.declaredCity + "」与解析城市「" +
-        (resolved.resolvedCity || "") + "」名称不同（多为本地语言/别称，已保留在行程中）"
-      );
     }
   });
   return {
     timeFeasibility: null,
     lodgingWarnings: [],
-    warnings: cityNotes,
+    warnings: [],
     excludedPlaces: excludedPlaces,
   };
 }
