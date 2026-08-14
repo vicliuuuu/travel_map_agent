@@ -18,6 +18,17 @@
     routeMode: "driving",
     transitComputed: false,
     transitMissingCount: 0,
+    // v2.0（变体 A）对话会话（无状态后端：草稿/历史/状态由前端逐轮回传）。
+    dialog: {
+      started: false,
+      sending: false,
+      dialogState: "greet",
+      draft: null,
+      history: [],
+      clarifyCount: 0,
+      turnIndex: 0,
+      hasPlan: false,
+    },
   };
 
   var ui = {
@@ -51,6 +62,13 @@
     routeModeToggle: document.getElementById("routeModeToggle"),
     routeModeDrivingBtn: document.getElementById("routeModeDrivingBtn"),
     routeModeTransitBtn: document.getElementById("routeModeTransitBtn"),
+    openDialogBtn: document.getElementById("openDialogBtn"),
+    dialogPanel: document.getElementById("dialogPanel"),
+    dialogCloseBtn: document.getElementById("dialogCloseBtn"),
+    dialogMessages: document.getElementById("dialogMessages"),
+    dialogInput: document.getElementById("dialogInput"),
+    dialogSendBtn: document.getElementById("dialogSendBtn"),
+    dialogConfirmBtn: document.getElementById("dialogConfirmBtn"),
   };
 
   var ITINERARY_PLACEHOLDER =
@@ -1744,6 +1762,261 @@
     renderPlacesList();
   }
 
+  // ===== v2.0（变体 A）对话式规划客户端 =====
+
+  function readAgentConfig() {
+    return {
+      mapsApiKey: ui.apiKeyInput.value.trim(),
+      llmBaseUrl: ui.llmBaseUrlInput.value.trim(),
+      llmApiKey: ui.llmApiKeyInput.value.trim(),
+      llmModel: pickLlmModelValue(),
+    };
+  }
+
+  function scrollDialogToBottom() {
+    ui.dialogMessages.scrollTop = ui.dialogMessages.scrollHeight;
+  }
+
+  function appendDialogMessage(role, text) {
+    var div = document.createElement("div");
+    div.className = "dialog-msg " + role;
+    div.textContent = text;
+    ui.dialogMessages.appendChild(div);
+    scrollDialogToBottom();
+    return div;
+  }
+
+  function showDialogTyping() {
+    if (document.getElementById("dialogTyping")) {
+      return;
+    }
+    var div = document.createElement("div");
+    div.className = "dialog-typing";
+    div.id = "dialogTyping";
+    div.textContent = "助手正在思考…";
+    ui.dialogMessages.appendChild(div);
+    scrollDialogToBottom();
+  }
+
+  function hideDialogTyping() {
+    var t = document.getElementById("dialogTyping");
+    if (t) {
+      t.remove();
+    }
+  }
+
+  function setDialogBusy(busy) {
+    state.dialog.sending = busy;
+    ui.dialogSendBtn.disabled = busy;
+    ui.dialogConfirmBtn.disabled = busy;
+  }
+
+  function showConfirmButton(show) {
+    ui.dialogConfirmBtn.classList.toggle("hidden", !show);
+  }
+
+  function openDialogPanel() {
+    ui.dialogPanel.classList.remove("hidden");
+    if (!state.dialog.started) {
+      state.dialog.started = true;
+      sendDialogTurn({ greet: true });
+    }
+    setTimeout(function () {
+      ui.dialogInput.focus();
+    }, 50);
+  }
+
+  function closeDialogPanel() {
+    ui.dialogPanel.classList.add("hidden");
+  }
+
+  // 把对话草稿映射到左侧表单，让用户可见/可微调（透明性）。
+  function fillFormFromDraft(planInput) {
+    if (!planInput) {
+      return;
+    }
+    ui.destinationsRoot.innerHTML = "";
+    var dests = Array.isArray(planInput.destinations) ? planInput.destinations : [];
+    if (!dests.length) {
+      addCountry("");
+    }
+    dests.forEach(function (dd) {
+      var countryBlock = createCountryBlock(dd.country || "");
+      ui.destinationsRoot.appendChild(countryBlock);
+      var cities = Array.isArray(dd.cities) ? dd.cities : [];
+      if (!cities.length) {
+        addCityToCountry(countryBlock, "");
+      }
+      cities.forEach(function (c) {
+        addCityToCountry(countryBlock, c.city || "");
+        var cityBlocks = countryBlock.querySelectorAll(".destination-city");
+        var cityBlock = cityBlocks[cityBlocks.length - 1];
+        var body = cityBlock.querySelector(".city-places-grid-body");
+        body.innerHTML = ""; // 清掉 addCityToCountry 自动加的空行
+        var places = Array.isArray(c.places) ? c.places : [];
+        if (!places.length) {
+          addPlaceRowToCity(cityBlock, "", "");
+        } else {
+          places.forEach(function (p) {
+            addPlaceRowToCity(cityBlock, p.name || "", p.address || "");
+          });
+        }
+      });
+    });
+    if (ui.hotelsList) {
+      ui.hotelsList.innerHTML = "";
+      var hotels = (planInput.lodging && planInput.lodging.hotels) || [];
+      if (!hotels.length) {
+        addHotelRow(null);
+      } else {
+        hotels.forEach(function (h) {
+          addHotelRow(h);
+        });
+      }
+    }
+    if (planInput.totalDays) {
+      ui.daysInput.value = planInput.totalDays;
+    }
+    if (planInput.visitMinutes) {
+      ui.visitMinutesInput.value = planInput.visitMinutes;
+    }
+    if (planInput.strategy && ui.strategySelect) {
+      ui.strategySelect.value = planInput.strategy;
+    }
+    if (planInput.transportPreference && ui.transportSelect) {
+      ui.transportSelect.value = planInput.transportPreference;
+    }
+    if (planInput.physicalPreference && ui.physicalSelect) {
+      ui.physicalSelect.value = planInput.physicalPreference;
+    }
+    refreshPlacesPreview();
+  }
+
+  // 复用现有渲染链路展示对话规划结果（路书 + 地图 + 局部重算上下文）。
+  async function applyDialogPlanResult(data, planInput) {
+    var country = (planInput && planInput.country) || "";
+    var city = (planInput && planInput.city) || "";
+    var planData = Array.isArray(data.planData) ? data.planData : [];
+    state.places = Array.isArray(data.enrichedPlaces) ? data.enrichedPlaces : state.places;
+    state.lastAgentResult = data;
+    state.lastPlanContext = {
+      country: country,
+      city: city,
+      lodging: (planInput && planInput.lodging) || null,
+      strategy: (planInput && planInput.strategy) || "fastest",
+      transportPreference: (planInput && planInput.transportPreference) || "driving",
+      physicalPreference: (planInput && planInput.physicalPreference) || "standard",
+    };
+    renderPlacesList();
+    renderAgentRoadbook(data, country, city);
+    if (state.mapReady) {
+      await renderRouteOnMap(planData, country, city, data.lodgingSummary || null);
+    }
+    setLayoutMode("roadbook");
+    updateStatus("对话式规划完成，路书已生成。", false);
+  }
+
+  function handleDialogResponse(resp) {
+    var d = state.dialog;
+    if (resp.draft) {
+      d.draft = resp.draft;
+    }
+    if (resp.dialogState) {
+      d.dialogState = resp.dialogState;
+    }
+    if (typeof resp.clarifyCount === "number") {
+      d.clarifyCount = resp.clarifyCount;
+    }
+    if (typeof resp.turnIndex === "number") {
+      d.turnIndex = resp.turnIndex + 1;
+    }
+    if (resp.reply) {
+      appendDialogMessage("assistant", resp.reply);
+      d.history.push({ role: "assistant", content: resp.reply });
+    }
+    showConfirmButton(resp.action === "confirm");
+    if (resp.action === "present" || resp.action === "refine") {
+      d.hasPlan = true;
+      if (resp.planInput) {
+        fillFormFromDraft(resp.planInput);
+      }
+      if (resp.plan) {
+        applyDialogPlanResult(resp.plan, resp.planInput);
+      }
+      if (resp.assumptions && resp.assumptions.length) {
+        appendDialogMessage("system", "默认假设：" + resp.assumptions.join("；"));
+      }
+    }
+  }
+
+  async function sendDialogTurn(opts) {
+    if (state.dialog.sending) {
+      return;
+    }
+    var o = opts || {};
+    var cfg = readAgentConfig();
+    if (!o.greet && (!cfg.llmBaseUrl || !cfg.llmApiKey || !cfg.llmModel)) {
+      appendDialogMessage("system", "请先在下方表单填好 LLM 配置（Base URL / API Key / Model）。");
+      return;
+    }
+    var d = state.dialog;
+    var body = {
+      dialogState: d.dialogState,
+      draft: d.draft,
+      history: d.history.slice(),
+      clarifyCount: d.clarifyCount,
+      turnIndex: d.turnIndex,
+      hasPlan: d.hasPlan,
+      confirmed: o.confirmed === true,
+      userMessage: o.userMessage || "",
+      llmBaseUrl: cfg.llmBaseUrl,
+      llmApiKey: cfg.llmApiKey,
+      llmModel: cfg.llmModel,
+      mapsApiKey: cfg.mapsApiKey,
+    };
+    // 本轮用户输入随后进入历史（供后续轮次上下文，避免与本轮 userMessage 重复）。
+    if (o.userMessage) {
+      d.history.push({ role: "user", content: o.userMessage });
+    }
+    setDialogBusy(true);
+    showDialogTyping();
+    try {
+      var resp = await fetch("/api/agent/dialog", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      var payload = await resp.json();
+      hideDialogTyping();
+      if (!resp.ok) {
+        throw new Error(payload && payload.error ? payload.error : ("对话失败(" + resp.status + ")"));
+      }
+      handleDialogResponse(payload);
+    } catch (err) {
+      hideDialogTyping();
+      appendDialogMessage("system", "出错了：" + err.message);
+    } finally {
+      setDialogBusy(false);
+    }
+  }
+
+  function sendDialogUserMessage() {
+    var text = ui.dialogInput.value.trim();
+    if (!text) {
+      return;
+    }
+    appendDialogMessage("user", text);
+    ui.dialogInput.value = "";
+    showConfirmButton(false);
+    sendDialogTurn({ userMessage: text });
+  }
+
+  function confirmDialogPlan() {
+    showConfirmButton(false);
+    appendDialogMessage("user", "确认并规划");
+    sendDialogTurn({ confirmed: true });
+  }
+
   function attachEventHandlers() {
     ui.connectMapBtn.addEventListener("click", connectGoogleMap);
     ui.addCountryBtn.addEventListener("click", function () {
@@ -1777,6 +2050,34 @@
     ui.agentPlanBtn.addEventListener("click", function () {
       agentPlanWithTools();
     });
+    // v2.0（变体 A）对话式规划入口与交互。
+    if (ui.openDialogBtn) {
+      ui.openDialogBtn.addEventListener("click", openDialogPanel);
+    }
+    if (ui.dialogCloseBtn) {
+      ui.dialogCloseBtn.addEventListener("click", closeDialogPanel);
+    }
+    if (ui.dialogSendBtn) {
+      ui.dialogSendBtn.addEventListener("click", sendDialogUserMessage);
+    }
+    if (ui.dialogConfirmBtn) {
+      ui.dialogConfirmBtn.addEventListener("click", confirmDialogPlan);
+    }
+    if (ui.dialogInput) {
+      ui.dialogInput.addEventListener("keydown", function (event) {
+        if (event.key === "Enter" && !event.shiftKey) {
+          event.preventDefault();
+          sendDialogUserMessage();
+        }
+      });
+    }
+    if (ui.dialogPanel) {
+      ui.dialogPanel.addEventListener("click", function (event) {
+        if (event.target === ui.dialogPanel) {
+          closeDialogPanel();
+        }
+      });
+    }
     // v1.6 局部重算：路书区内景点的删除/移天控件走事件委托。
     ui.itineraryResult.addEventListener("click", handleRoadbookClick);
     ui.itineraryResult.addEventListener("change", handleRoadbookChange);

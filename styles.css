@@ -666,3 +666,146 @@ button[disabled] {
     width: 100%;
   }
 }
+
+/* v2.0（变体 A）对话式规划面板 */
+.dialog-launch-btn {
+  margin-top: 12px;
+  padding: 8px 16px;
+  border: none;
+  border-radius: 999px;
+  background: #22d3ee;
+  color: #0f172a;
+  font-weight: 700;
+  cursor: pointer;
+}
+.dialog-launch-btn:hover {
+  background: #67e8f9;
+}
+
+.dialog-panel {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+.dialog-panel.hidden {
+  display: none;
+}
+.dialog-card {
+  width: min(560px, 92vw);
+  height: min(680px, 88vh);
+  background: #ffffff;
+  border-radius: 14px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.dialog-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  background: #0f172a;
+  color: #ffffff;
+}
+.dialog-title {
+  font-weight: 700;
+}
+.dialog-messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  background: #f8fafc;
+}
+.dialog-msg {
+  max-width: 82%;
+  padding: 10px 12px;
+  border-radius: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.dialog-msg.user {
+  align-self: flex-end;
+  background: #2563eb;
+  color: #ffffff;
+  border-bottom-right-radius: 4px;
+}
+.dialog-msg.assistant {
+  align-self: flex-start;
+  background: #e2e8f0;
+  color: #0f172a;
+  border-bottom-left-radius: 4px;
+}
+.dialog-msg.system {
+  align-self: center;
+  background: transparent;
+  color: #64748b;
+  font-size: 13px;
+}
+.dialog-hint {
+  padding: 6px 16px;
+  font-size: 12px;
+  color: #64748b;
+  background: #f1f5f9;
+}
+.dialog-input-row {
+  padding: 12px 16px;
+  border-top: 1px solid #e2e8f0;
+  display: flex;
+  gap: 10px;
+  align-items: flex-end;
+}
+.dialog-input {
+  flex: 1;
+  resize: none;
+  padding: 8px 10px;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  font-family: inherit;
+  font-size: 14px;
+}
+.dialog-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.dialog-actions button {
+  padding: 8px 14px;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  background: #334155;
+  color: #ffffff;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.dialog-actions button:hover {
+  background: #475569;
+}
+.dialog-actions .btn-primary {
+  background: #16a34a;
+}
+.dialog-actions .btn-primary:hover {
+  background: #22c55e;
+}
+.dialog-actions button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.dialog-actions .hidden {
+  display: none;
+}
+.dialog-typing {
+  align-self: flex-start;
+  color: #94a3b8;
+  font-size: 13px;
+  font-style: italic;
+}

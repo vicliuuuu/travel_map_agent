@@ -3,14 +3,34 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>旅行规划 Agent · 内测 v1.6</title>
+  <title>旅行规划 Agent · 内测 v2.0</title>
   <link rel="stylesheet" href="./styles.css" />
 </head>
 <body>
   <header class="topbar">
-    <h1>旅行规划 Agent · 内测 v1.6</h1>
+    <h1>旅行规划 Agent · 内测 v2.0</h1>
     <p>多国家/多城市层级输入 + 可选酒店锚点；策略引擎（多策略打分 + 候选剪枝 + 打分兜底）、按城市聚类分天、跨城公共交通分段与酒店闭环硬约束；可插拔工具层（营业时间等外部事实）与扩展校验（闭馆/体力/回酒店往返）。</p>
+    <button id="openDialogBtn" type="button" class="dialog-launch-btn">🗨 对话式规划（v2.0）</button>
   </header>
+
+  <!-- v2.0（变体 A）对话式规划面板：多轮问答收集约束，自动填表并直接出路书。 -->
+  <div id="dialogPanel" class="dialog-panel hidden" role="dialog" aria-label="对话式规划">
+    <div class="dialog-card">
+      <div class="dialog-header">
+        <span class="dialog-title">对话式规划助手 · v2.0</span>
+        <button id="dialogCloseBtn" type="button" class="btn-icon" aria-label="关闭">×</button>
+      </div>
+      <div id="dialogMessages" class="dialog-messages"></div>
+      <div class="dialog-hint">提示：先在下方表单填好 LLM 配置与 Google Maps Key（我不会向你索要密钥）。</div>
+      <div class="dialog-input-row">
+        <textarea id="dialogInput" class="dialog-input" rows="2" placeholder="用大白话说说你的行程，比如：去京都玩3天，想去清水寺、伏见稻荷，带老人慢一点"></textarea>
+        <div class="dialog-actions">
+          <button id="dialogSendBtn" type="button">发送</button>
+          <button id="dialogConfirmBtn" type="button" class="btn-primary hidden">确认并规划</button>
+        </div>
+      </div>
+    </div>
+  </div>
 
   <main id="mainLayout" class="layout mode-input-focus">
     <section class="panel controls">

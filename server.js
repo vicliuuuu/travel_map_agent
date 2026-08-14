@@ -12,6 +12,8 @@ var repair = require("./repair.js");
 var stateMachine = require("./state-machine.js");
 var tools = require("./tools.js");
 var replan = require("./replan.js");
+var intake = require("./intake.js");
+var dialog = require("./dialog.js");
 
 // v1.3 收敛控制参数（可用环境变量覆盖，便于回归调参）
 var MAX_REPAIR_ROUNDS = Number(process.env.MAX_REPAIR_ROUNDS || repair.MAX_REPAIR_ROUNDS);
@@ -993,6 +995,9 @@ async function runToolCallingAgent(input, onProgress) {
     { role: "user", content: buildAgentPrompt(input) },
   ];
 
+  // v1.7 token 计量（内存态）：累计本次规划全部 LLM 调用的 usage，供成本指标。
+  var tokenUsage = { model: llmModel, promptTokens: 0, completionTokens: 0, totalTokens: 0, calls: 0 };
+
   var maxSteps = 14;
   var step;
   for (step = 0; step < maxSteps; step += 1) {
@@ -1023,6 +1028,13 @@ async function runToolCallingAgent(input, onProgress) {
     }
 
     var payload = await response.json();
+    var usage = payload && payload.usage ? payload.usage : null;
+    if (usage) {
+      tokenUsage.promptTokens += Number(usage.prompt_tokens) || 0;
+      tokenUsage.completionTokens += Number(usage.completion_tokens) || 0;
+      tokenUsage.totalTokens += Number(usage.total_tokens) || 0;
+    }
+    tokenUsage.calls += 1;
     var assistantMessage = (((payload || {}).choices || [])[0] || {}).message;
     if (!assistantMessage) {
       throw new Error("LLM 响应缺失 message");
@@ -1040,6 +1052,7 @@ async function runToolCallingAgent(input, onProgress) {
       return {
         analysis: llm.parseAgentPlanJson(finalText),
         toolContext: toolContext,
+        tokenUsage: tokenUsage,
       };
     }
 
@@ -1729,6 +1742,11 @@ function buildPlanStates(ctx, pushProgress) {
         );
         context.analysis = agentRun.analysis;
         context.toolContext = agentRun.toolContext;
+        // v1.7：累计 LLM token 用量到 ctx，并 emit token_usage 供成本指标。
+        context.tokenUsage = agentRun.tokenUsage || context.tokenUsage;
+        if (context.tokenUsage) {
+          context.tracer.tokenUsage(context.tokenUsage);
+        }
         context.tracer.emit({
           stage: "build_context",
           eventType: "tool_call",
@@ -2059,6 +2077,7 @@ function buildPlanStates(ctx, pushProgress) {
     finalize: {
       action: function (context) {
         pushProgress({ percent: 95, stage: "finalize", message: "整理路书与地图输出" });
+        context.finalStatus = "ok";
         context.result = assembleResult(context, { fallback: false });
         return { status: "ok" };
       },
@@ -2071,6 +2090,7 @@ function buildPlanStates(ctx, pushProgress) {
           unresolved: ((context.verifyResult && context.verifyResult.findings) || []).map(function (f) { return f.code; }),
         });
         pushProgress({ percent: 95, stage: "finalize", message: "输出保底可执行方案" });
+        context.finalStatus = "fallback";
         context.result = assembleResult(context, { fallback: true });
         return { status: "ok" };
       },
@@ -2106,6 +2126,7 @@ async function buildAgentPlanPayload(rawBody, reportProgress) {
   }
 
   var requestTracer = tracer.createTracer();
+  var startedAt = Date.now();
   var ctx = {
     body: body,
     normalized: normalized,
@@ -2120,6 +2141,8 @@ async function buildAgentPlanPayload(rawBody, reportProgress) {
     dailyPlans: [],
     verifyResult: null,
     fallbackReason: null,
+    finalStatus: null,
+    tokenUsage: null,
     result: null,
   };
   ctx.repairContext = buildRepairContext(ctx);
@@ -2146,7 +2169,21 @@ async function buildAgentPlanPayload(rawBody, reportProgress) {
       tracer: requestTracer,
       maxTransitions: 40,
     });
+  } catch (runErr) {
+    // 异常也要在汇总里如实体现终态，不静默（错误照常向上抛出）。
+    ctx.finalStatus = "error";
+    throw runErr;
   } finally {
+    // v1.7 请求级汇总（内存态）：总耗时/最终状态/修复轮次/token，供单次指标计算。
+    var usage = ctx.tokenUsage || {};
+    requestTracer.requestSummary({
+      totalDurationMs: Date.now() - startedAt,
+      finalStatus: ctx.finalStatus || "unknown",
+      repairRounds: ctx.repairRounds,
+      promptTokens: usage.promptTokens,
+      completionTokens: usage.completionTokens,
+      totalTokens: usage.totalTokens,
+    });
     // 无论收敛/兜底/异常，都记录 trace 供 /api/debug/last-trace 复盘
     tracer.recordTrace(requestTracer);
   }
@@ -2341,6 +2378,227 @@ async function handleAgentReplan(req, res) {
   }
 }
 
+// v2.0 从任意文本中稳健提取 JSON 对象（兼容 ```json``` 围栏与裸 { ... }）。
+function extractJsonObject(rawText) {
+  var text = String(rawText || "").trim();
+  if (!text) {
+    throw new Error("LLM 抽取返回为空");
+  }
+  var fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced && fenced[1]) {
+    return JSON.parse(fenced[1].trim());
+  }
+  var first = text.indexOf("{");
+  var last = text.lastIndexOf("}");
+  if (first >= 0 && last > first) {
+    return JSON.parse(text.slice(first, last + 1));
+  }
+  return JSON.parse(text);
+}
+
+// v2.0 一次性 LLM 对话（JSON 结果），供约束抽取复用；返回 { data, usage }。
+async function callLlmChatJson(cfg, messages) {
+  var base = String(cfg.llmBaseUrl || "").replace(/\/$/, "");
+  var response = await fetch(base + "/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: "Bearer " + cfg.llmApiKey,
+    },
+    body: JSON.stringify({
+      model: cfg.llmModel,
+      temperature: 0.1,
+      messages: messages,
+    }),
+  });
+  if (!response.ok) {
+    var errText = await response.text();
+    throw new Error("LLM 抽取请求失败(" + response.status + "): " + errText);
+  }
+  var payload = await response.json();
+  var message = (((payload || {}).choices || [])[0] || {}).message;
+  var content = message ? (message.content || "") : "";
+  return { data: extractJsonObject(content), usage: payload && payload.usage ? payload.usage : null };
+}
+
+// v2.0（变体 A）对话编排：抽取约束 → 决策（问/确认/规划/改） → 复用现有 plan/replan。
+// 无状态友好：对话状态/草稿/历史由前端逐轮回传。API key 仅在服务端使用，不进对话上下文。
+async function buildAgentDialogPayload(rawBody) {
+  var body = applyEnvKeyFallback(rawBody || {});
+  var requestTracer = tracer.createTracer();
+  var dialogState = String(body.dialogState || "greet");
+  var draft = body.draft && typeof body.draft === "object" ? body.draft : intake.emptyDraft();
+  var history = Array.isArray(body.history) ? body.history.slice() : [];
+  var userMessage = typeof body.userMessage === "string" ? body.userMessage.trim() : "";
+  var clarifyCount = Number(body.clarifyCount) || 0;
+  var confirmed = body.confirmed === true;
+  var budget = Number(body.clarifyBudget) || intake.DEFAULT_CLARIFY_BUDGET;
+  var hasPlan = body.hasPlan === true;
+  var turnIndex = Number(body.turnIndex) || history.length;
+
+  try {
+    // 首轮问候：无历史、无用户输入、未确认。
+    if (!userMessage && !history.length && !confirmed && (dialogState === "greet" || !dialogState)) {
+      requestTracer.dialogTurn({ turnIndex: turnIndex, dialogState: "greet", intent: "greet" });
+      return {
+        action: "greet",
+        reply: dialog.buildGreeting(),
+        draft: draft,
+        dialogState: "gather",
+        clarifyCount: clarifyCount,
+        turnIndex: turnIndex,
+        traceId: requestTracer.traceId,
+      };
+    }
+
+    if (userMessage) {
+      history.push({ role: "user", content: userMessage });
+    }
+
+    // 抽取 + 合并（确认动作本身不需要再抽取，但有新文本也无妨）。
+    if (userMessage) {
+      var llmCfg = { llmBaseUrl: body.llmBaseUrl, llmApiKey: body.llmApiKey, llmModel: body.llmModel };
+      if (!llmCfg.llmBaseUrl || !llmCfg.llmApiKey || !llmCfg.llmModel) {
+        var cfgErr = new Error("对话抽取需要完整 LLM 配置");
+        cfgErr.statusCode = 400;
+        cfgErr.payload = { error: "对话抽取需要完整 LLM 配置（llmBaseUrl/llmApiKey/llmModel）" };
+        throw cfgErr;
+      }
+      var extraction = await intake.extractConstraints(history, draft, function (messages) {
+        return callLlmChatJson(llmCfg, messages).then(function (r) {
+          if (r.usage) {
+            requestTracer.tokenUsage({
+              model: body.llmModel,
+              promptTokens: Number(r.usage.prompt_tokens) || 0,
+              completionTokens: Number(r.usage.completion_tokens) || 0,
+              totalTokens: Number(r.usage.total_tokens) || 0,
+              calls: 1,
+            });
+          }
+          return r.data;
+        });
+      });
+      draft = intake.mergeConstraints(draft, Object.assign({}, extraction.delta, { confidence: extraction.confidence }));
+      requestTracer.constraintExtract({
+        extracted: extraction.delta,
+        confidence: extraction.confidence,
+        missing: intake.missingRequired(draft),
+      });
+    }
+
+    var decision = dialog.runDialogTurn({
+      dialogState: dialogState,
+      draft: draft,
+      clarifyCount: clarifyCount,
+      confirmed: confirmed,
+      budget: budget,
+      hasPlan: hasPlan,
+    });
+    requestTracer.dialogTurn({ turnIndex: turnIndex, dialogState: decision.nextState, intent: decision.action });
+
+    if (decision.action === "ask") {
+      requestTracer.clarify({ question: decision.question, triggeredBy: decision.triggeredBy });
+      history.push({ role: "assistant", content: decision.question });
+      return {
+        action: "ask",
+        reply: decision.question,
+        draft: draft,
+        dialogState: "clarify",
+        clarifyCount: clarifyCount + 1,
+        turnIndex: turnIndex,
+        missing: decision.missing,
+        traceId: requestTracer.traceId,
+      };
+    }
+
+    if (decision.action === "confirm") {
+      var summary = dialog.buildConfirmSummary(draft);
+      history.push({ role: "assistant", content: summary });
+      return {
+        action: "confirm",
+        reply: summary,
+        draft: draft,
+        dialogState: "confirm",
+        clarifyCount: clarifyCount,
+        turnIndex: turnIndex,
+        planInput: intake.buildPlanInputFromDraft(draft),
+        traceId: requestTracer.traceId,
+      };
+    }
+
+    // present / refine：复用现有规划链路。
+    var mapsApiKey = String(body.mapsApiKey || "");
+    if (!mapsApiKey || !body.llmBaseUrl || !body.llmApiKey || !body.llmModel) {
+      var planCfgErr = new Error("规划需要完整 LLM 配置与 Google Maps API Key");
+      planCfgErr.statusCode = 400;
+      planCfgErr.payload = { error: "规划需要完整 LLM 配置与 Google Maps API Key" };
+      throw planCfgErr;
+    }
+
+    // refine：若客户端提供了 changeEvent + 上次规划上下文，则走 v1.6 局部重算。
+    if (decision.action === "refine" && body.changeEvent && Array.isArray(body.planData) && body.planData.length) {
+      var replanResult = buildAgentReplanPayload(body);
+      requestTracer.dialogRefine({
+        changeType: replanResult.changeType,
+        incrementalReused: replanResult.reusedRatio,
+      });
+      return {
+        action: "refine",
+        reply: "已按你的调整局部重算（仅重算受影响天，复用其余）。",
+        draft: draft,
+        dialogState: "present",
+        plan: replanResult,
+        incremental: true,
+        turnIndex: turnIndex,
+        traceId: requestTracer.traceId,
+      };
+    }
+
+    var planInput = intake.buildPlanInputFromDraft(draft);
+    var planBody = Object.assign({}, planInput, {
+      llmBaseUrl: body.llmBaseUrl,
+      llmApiKey: body.llmApiKey,
+      llmModel: body.llmModel,
+      mapsApiKey: mapsApiKey,
+    });
+    var planResult = await buildAgentPlanPayload(planBody);
+    if (decision.action === "refine") {
+      requestTracer.dialogRefine({ changeType: "full_replan", incrementalReused: null });
+    }
+    requestTracer.evidenceRef({ claim: "final_itinerary", sourceEvent: planResult.traceId || "plan" });
+    var reply = decision.action === "refine"
+      ? "已根据你的调整重新规划好了，看看下面的路书。"
+      : "我按你的需求排好了，路书在下面。想改哪天/删哪个点直接跟我说。";
+    return {
+      action: "present",
+      reply: reply,
+      draft: draft,
+      dialogState: "present",
+      plan: planResult,
+      planInput: planInput,
+      assumptions: planInput._assumptions || [],
+      turnIndex: turnIndex,
+      traceId: requestTracer.traceId,
+    };
+  } finally {
+    tracer.recordTrace(requestTracer);
+  }
+}
+
+async function handleAgentDialog(req, res) {
+  try {
+    var body = await readRequestBody(req);
+    var payload = await buildAgentDialogPayload(body);
+    sendJson(res, 200, payload);
+  } catch (err) {
+    if (err && err.statusCode && err.payload) {
+      sendJson(res, err.statusCode, err.payload);
+      return;
+    }
+    sendJson(res, 500, { error: err.message });
+  }
+}
+
 function writeNdjson(res, payload) {
   res.write(JSON.stringify(payload) + "\n");
 }
@@ -2499,6 +2757,14 @@ var server = http.createServer(function (req, res) {
       return;
     }
     handleAgentReplan(req, res);
+    return;
+  }
+  // v2.0（变体 A）对话式规划：多轮问答收集约束 → 决策 → 复用 plan/replan。
+  if (req.method === "POST" && req.url === "/api/agent/dialog") {
+    if (!enforceRateLimit(req, res)) {
+      return;
+    }
+    handleAgentDialog(req, res);
     return;
   }
   if (req.method === "GET") {

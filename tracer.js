@@ -7,10 +7,14 @@
 // v1.5：新增 fact_source / tool_degrade 两类事件；tool_call 复用统一通道承载新工具（opening_hours/weather/congestion）
 //       的 provider/cacheHit/degraded；validation 承载新增 code（OPENING_RISK/PHYSICAL_OVERLOAD/HOTEL_RETURN_COST）。schema 升至 1.5.0。
 // v1.6：新增 incremental_replan 事件（局部重算，payload 含 changeType/affectedScope/reusedRatio/dayCount），复用统一 emit 通道，schema 升至 1.6.0。
+// v1.7：新增 token_usage（单次 LLM 调用的 token 计量）与 request_summary（请求级汇总：总耗时/最终状态/修复轮次/token）两类事件，
+//       均为「内存态」埋点，供单次指标计算（metrics.js）消费；trace 落盘/回放/门禁按前瞻规划 §0 PENDING（依赖持久化存储）。schema 升至 1.7.0。
+// v2.0（变体 A）：新增对话维度 5 类事件 dialog_turn / constraint_extract / clarify / dialog_refine / evidence_ref，
+//       均为「内存态」埋点（会话内可复盘）；跨会话回放/门禁仍 PENDING（依赖落盘，见 内测-v2.0-实施方案.md §0）。schema 升至 2.0.0。
 
 var crypto = require("crypto");
 
-var SCHEMA_VERSION = "1.6.0";
+var SCHEMA_VERSION = "2.0.0";
 
 function newId() {
   if (crypto && typeof crypto.randomUUID === "function") {
@@ -187,6 +191,115 @@ function createTracer(options) {
     });
   }
 
+  // v1.7 单次 LLM 调用 token 计量（内存态）：供成本指标聚合；不落盘（§0 PENDING）。
+  function tokenUsage(info) {
+    var i = info || {};
+    return emit({
+      stage: i.stage || "llm",
+      eventType: "token_usage",
+      status: "ok",
+      payload: {
+        model: i.model || "",
+        promptTokens: Number(i.promptTokens) || 0,
+        completionTokens: Number(i.completionTokens) || 0,
+        totalTokens: Number(i.totalTokens) || 0,
+        calls: Number(i.calls) || 0,
+      },
+    });
+  }
+
+  // v1.7 请求级汇总（内存态）：在请求收口时 emit 一次，供 metrics 直接读单请求总览。
+  function requestSummary(info) {
+    var i = info || {};
+    var finalStatus = i.finalStatus || "unknown";
+    return emit({
+      stage: "finalize",
+      eventType: "request_summary",
+      status: finalStatus === "error" ? "error" : (finalStatus === "fallback" ? "warn" : "ok"),
+      durationMs: Number(i.totalDurationMs) || 0,
+      payload: {
+        totalDurationMs: Number(i.totalDurationMs) || 0,
+        finalStatus: finalStatus,
+        repairRounds: Number(i.repairRounds) || 0,
+        promptTokens: Number(i.promptTokens) || 0,
+        completionTokens: Number(i.completionTokens) || 0,
+        totalTokens: Number(i.totalTokens) || 0,
+      },
+    });
+  }
+
+  // v2.0 对话轮次（内存态）：记录每轮对话状态流转。
+  function dialogTurn(info) {
+    var i = info || {};
+    return emit({
+      stage: "dialog",
+      eventType: "dialog_turn",
+      status: "ok",
+      payload: {
+        turnIndex: Number(i.turnIndex) || 0,
+        dialogState: i.dialogState || "",
+        intent: i.intent || "",
+      },
+    });
+  }
+
+  // v2.0 约束抽取（内存态）：记录抽取到的字段、置信度与缺失项。
+  function constraintExtract(info) {
+    var i = info || {};
+    return emit({
+      stage: "dialog",
+      eventType: "constraint_extract",
+      status: "ok",
+      payload: {
+        extracted: i.extracted || {},
+        confidence: i.confidence || {},
+        missing: Array.isArray(i.missing) ? i.missing : [],
+      },
+    });
+  }
+
+  // v2.0 主动澄清（内存态）：记录澄清问题与触发原因。
+  function clarify(info) {
+    var i = info || {};
+    return emit({
+      stage: "dialog",
+      eventType: "clarify",
+      status: "ok",
+      payload: {
+        question: i.question || "",
+        triggeredBy: i.triggeredBy || "",
+      },
+    });
+  }
+
+  // v2.0 对话内修改（内存态）：记录对话触发的改点及是否复用 v1.6 局部重算。
+  function dialogRefine(info) {
+    var i = info || {};
+    return emit({
+      stage: "dialog",
+      eventType: "dialog_refine",
+      status: "ok",
+      payload: {
+        changeType: i.changeType || "",
+        incrementalReused: typeof i.incrementalReused === "number" ? i.incrementalReused : null,
+      },
+    });
+  }
+
+  // v2.0 证据引用（内存态）：把一个对话结论绑定到底层证据事件，保证可追溯。
+  function evidenceRef(info) {
+    var i = info || {};
+    return emit({
+      stage: "dialog",
+      eventType: "evidence_ref",
+      status: "ok",
+      payload: {
+        claim: i.claim || "",
+        sourceEvent: i.sourceEvent || "",
+      },
+    });
+  }
+
   // 工具调用统一包裹：自动记录 durationMs / ok / cacheHit
   function withTrace(toolName, fn, meta) {
     var started = Date.now();
@@ -236,6 +349,13 @@ function createTracer(options) {
     fallback: fallback,
     factSource: factSource,
     toolDegrade: toolDegrade,
+    tokenUsage: tokenUsage,
+    requestSummary: requestSummary,
+    dialogTurn: dialogTurn,
+    constraintExtract: constraintExtract,
+    clarify: clarify,
+    dialogRefine: dialogRefine,
+    evidenceRef: evidenceRef,
     withTrace: withTrace,
     snapshot: snapshot,
   };
