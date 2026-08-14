@@ -537,3 +537,58 @@
 - 涉及文件：`server.js`、`verifier.js`、`agent-planner.js`、`package.json`、`tests/day-estimate.test.js`、`tests/verifier.test.js`。
 
 修改时间：2026-08-11 18:20 (UTC+8)
+
+## 2026-08-14（v1.7 规划范围收敛：依赖落盘的能力 PENDING）
+
+仅文档调整，未改代码。承接讨论：v1.7「回放/历史 trace 存储」与 v1.6 长期记忆撞同一堵墙——Render 临时文件系统 + 后端不回写 GitHub 仓库，数据无法可靠落盘。用户决策：**凡依赖数据落盘/持久化的能力整体 PENDING**，本期 v1.7 仅保留「纯内存的埋点补全 + 单次指标计算」。
+
+- `doc_auto/内测-v1.7-前瞻规划.md`：
+  - 顶部状态行改为「范围已收敛（PENDING 决策）」；新增 **§0 范围调整说明**（背景 / 与记忆的异同 / 决策 / 受影响 PENDING 清单 / 仍推进 ACTIVE 清单）。
+  - §1 版本定位表、§2.1 P0（Trace 查询可视化、时序看板、baseline 对比 / 门禁）、§2.2 P1（回放、告警、可持久化限流）、§8.1/§8.3/§8.4 均标注 **PENDING**；§8.2 指标计算、埋点补全（`request_summary`/`tokenCost`）标注 **ACTIVE**。
+- **ACTIVE（本期可做）**：`request_summary`/`tokenCost` 内存态埋点补全；对单次 / 内存 trace 计算核心指标（成功率、违例率、修复轮次、延迟、局部重算复用率等）；评测集单次跑通出当次指标。
+- **PENDING（待持久化存储）**：trace 落盘与 `GET /api/trace/:requestId`、时序看板、回放复盘、baseline 留存与准入门禁、告警阈值、可持久化/跨实例限流；待存储方案确定后可与长期记忆一并解锁。
+
+修改时间：2026-08-14 13:56 (UTC+8)
+
+## 2026-08-14（内测 v1.7 ACTIVE 子集：可观测埋点补全 + 单次指标计算 + 评测集）
+
+按 v1.7 §0 收敛范围实现**不依赖数据落盘**的 ACTIVE 部分（纯内存），PENDING 部分（trace 落盘/回放/时序看板/baseline 门禁/告警/可持久化限流）不实现。
+
+- **埋点补全（内存态）`tracer.js`**：schema `1.6.0` → `1.7.0`；新增 `tokenUsage`（`token_usage` 事件：model/promptTokens/completionTokens/totalTokens/calls）与 `requestSummary`（`request_summary` 事件：totalDurationMs/finalStatus/repairRounds/token，finalStatus 映射 ok→ok、fallback→warn、error→error）两个方法，均走统一 `emit` 通道、不落盘。
+- **token 计量 `server.js`**：`runToolCallingAgent` 累计本次规划全部 LLM 调用的 `usage`（prompt/completion/total），返回 `tokenUsage`；`build_context` 存入 `ctx.tokenUsage` 并 `emit token_usage`。
+- **请求级汇总 `server.js`**：`buildAgentPlanPayload` 记录 `startedAt`；`finalize` 置 `ctx.finalStatus='ok'`、`fallback` 置 `'fallback'`、状态机异常置 `'error'`（异常照常上抛，不静默）；在收口 `finally` 中 `emit request_summary`（总耗时/终态/修复轮次/token）后再 `recordTrace`。
+- **指标引擎 `metrics.js`（新增，纯内存）**：`computeMetricsFromTrace(trace)` 从单次/内存 trace 计算 finalStatus、totalDurationMs、repairRounds、violationCount、warningCount、toolCallCount/toolErrorCount、cacheHitRate、fallbackTriggered、totalTokens、incrementalReusedRatio、stageDurations（request_summary 优先，缺失按文档口径推断）；`aggregateMetrics(traces|metrics[])` 出 successRate/fallbackRate/errorRate/violationRate/avg* 与加权 cacheHitRate；`METRIC_DEFINITIONS` 固化每个指标口径。非法输入抛错（无静默失败）。
+- **评测集 `eval/`（新增，纯内存）**：`eval-set.js` 定义 5 个标准场景（跨国跨城 / 同城高密 / 无酒店 / 超载兜底 / 换酒店，覆盖 v1.3–v1.6）含 `expect`；`eval-runner.js` 的 `runEvalSet({cases, runOne})` 注入式跑通 → 抽指标 → 聚合当次报告，`gating:false`、不留 baseline、不落盘；单 case 失败如实记录且不中断其余（无静默失败）。
+- **测试**：新增 `tests/metrics.test.js`（7 例：口径精确计算 / 无 summary 推断 / reusedRatio / 非法输入抛错 / 聚合 / 空批 / 口径表）、`tests/eval-set.test.js`（6 例：场景覆盖 / 全量跑通聚合 / 失败隔离 / 缺 runOne 抛错 / 期望标注）；`tests/tracer.test.js` 增 token_usage / request_summary / schema=1.7.0 三例。`package.json` test 脚本纳入两个新测试文件。全量 `node --test` **174/174** 通过（159 → 174）。
+- **版本与文档**：`package.json` `1.6.0`→`1.7.0`（描述标注 ACTIVE 子集）、`index.html` 标题/页头 `内测 v1.6`→`内测 v1.7`、`VERSION`→`内测 v1.7.0`、`README.md` 版本行 + v1.7 能力概览 + PENDING 说明。
+- **未做（PENDING，见 §0）**：trace 持久化落盘、`GET /api/trace/:requestId`、时序看板、回放复盘、baseline 对比与准入门禁、告警阈值、可持久化/跨实例限流；未改前端展示（指标目前仅在内存 trace / `/api/debug/last-trace` 可见）。
+
+修改时间：2026-08-14 14:08 (UTC+8)
+
+## 2026-08-14（v2.0 立项：对话式旅行副驾驶 · 变体 A 实施方案）
+
+仅文档，未改代码。评估结论：v2.0「对话体验层」在现有代码基础上全部可实现，仅长期记忆（无持久盘）与跨会话回放/门禁（依赖落盘）按既有 PENDING 边界降级。用户拍板采用**变体 A（内存态 v2.0）**，并先落方案文档再开工。
+
+- 新增 `doc_auto/内测-v2.0-实施方案.md`：把 v2.0 前瞻规划落地为可执行方案。
+  - §0 范围与边界：ACTIVE（多轮对话/约束抽取+澄清/对话内改行程接 v1.6 replan/证据绑定/解释性对话/多方案推荐/对话埋点）；降级或 PENDING（长期记忆→合理默认、跨会话回放→会话内复盘、门禁→单次评测跑通、多模态不做）。明确「证据绑定与解释性对话仅需内存 trace，不降级」。
+  - 架构与复用清单：对话层新增 `dialog.js`/`intake.js`/`POST /api/agent/dialog`，规划/改行程/多方案/解释全部复用现有 `buildAgentPlanPayload`、`POST /api/agent/replan`、`compareStrategies`、`scoreRouteDetailed`、内存 `tracer`、`metrics.js`。
+  - 对话-规划双状态机（greet→gather→clarify→confirm→present→refine），澄清预算默认 6、必填=目的地+景点+天数、其余合理默认。
+  - 对话维度埋点（`dialog_turn`/`constraint_extract`/`clarify`/`dialog_refine`/`evidence_ref`，schema 拟升 2.0.0，内存态）。
+  - 分阶段 P1–P7、降级版 DoD 验收、测试计划（`tests/intake.test.js`/`tests/dialog.test.js`）、风险（对话放大幻觉/过度澄清/无记忆/key 安全）。
+- 变体 B（接外部托管存储一并解锁记忆+落盘+回放+门禁 = 100% 终态）暂缓，待变体 A 落地后评估。
+
+修改时间：2026-08-14 14:20 (UTC+8)
+
+## 2026-08-14（v2.0 变体 A 首版落地）
+
+按 [`内测-v2.0-实施方案.md`](./内测-v2.0-实施方案.md) 实现「对话式规划（内存态）」，版本升至 **v2.0.0**（schema 2.0.0）。
+
+- **新增 `intake.js`（约束抽取/草稿管理，纯函数为主）**：`emptyDraft`/`parseExtraction`（校验裁剪 LLM 抽取，非法即抛不静默）/`mergeConstraints`（增量合并、列表去重、标量覆盖、不可变）/`missingRequired`+`isRequiredComplete`（必填=目的地+景点+天数）/`decideClarify`（澄清预算默认 6）/`applyDefaults`（策略/出行/体力/时长默认 + 假设说明）/`groupDestinations`+`buildPlanInputFromDraft`（草稿→现有 plan 层级入参）/`extractConstraints`（注入式 LLM 调用，便于单测）。安全边界：绝不抽取/记录任何 API key/Base URL/model。
+- **新增 `dialog.js`（对话决策层，纯函数无副作用）**：`buildGreeting`/`buildConfirmSummary`/`runDialogTurn`（依据 状态+草稿+澄清计数+是否确认+是否已有规划，决策 ask/confirm/present/refine；确认但必填仍缺则回退澄清）。抽取与规划的副作用留在 server 侧，保证可单测、不依赖网络。
+- **`tracer.js`**：新增 5 类对话事件 `dialog_turn`/`constraint_extract`/`clarify`/`dialog_refine`/`evidence_ref`（均内存态），`SCHEMA_VERSION` 升至 **2.0.0**。
+- **`server.js`**：新增 `extractJsonObject`（稳健提取 JSON，兼容围栏/裸括号）、`callLlmChatJson`（一次性对话 JSON，供抽取复用并计 token）、`buildAgentDialogPayload`（编排：抽取→合并→决策→复用 `buildAgentPlanPayload`/`buildAgentReplanPayload`；无状态友好，草稿/历史/状态由前端逐轮回传；API key 仅服务端使用不进对话上下文）、`handleAgentDialog` 与路由 `POST /api/agent/dialog`（走既有限流）。
+- **前端**：`index.html` 版本升 v2.0 + 新增对话面板（浮层：消息流/输入/发送/「确认并规划」/关闭）；`styles.css` 新增面板样式；`app.js` 新增对话客户端（会话状态逐轮回传、打字指示、`fillFormFromDraft` 自动回填左侧表单以保证透明性、`applyDialogPlanResult` 复用 `renderAgentRoadbook`/`renderRouteOnMap` 出路书并保存局部重算上下文）。
+- **测试**：新增 `tests/intake.test.js`（11 例：抽取裁剪/合并去重不可变/必填/澄清预算/默认/草稿分组/注入抽取/无静默失败）、`tests/dialog.test.js`（8 例：ask/confirm/present/refine/确认回退/预算耗尽转确认/确认语）、`tracer.test.js` 增对话事件与 schema 2.0.0 断言。全量 **193/193** 通过；greet 端点线上冒烟通过。
+- **PENDING（承接 §0）**：跨会话记忆、对话回放、baseline 门禁仍待持久化存储；P4 证据解释话术、P5 多方案对话为下一步增量。
+
+修改时间：2026-08-14 14:45 (UTC+8)
